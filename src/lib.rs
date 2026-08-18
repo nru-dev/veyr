@@ -108,6 +108,8 @@ pub enum RemoteLaunchOutcome {
     RuntimeStartFailed = 6,
     /// A Rust panic was contained at the private worker ABI boundary.
     Panicked = 7,
+    /// The short-lived D3D9 capture hooks could not be restored safely.
+    CaptureCleanupFailed = 8,
 }
 
 /// Diagnostics for the one-shot player-circle startup worker.
@@ -400,6 +402,18 @@ unsafe fn launch_player_circle_worker(
     // The loader owns the outer deadline too. Clamp the in-process wait so a
     // malformed request can never leave a remote worker alive indefinitely.
     let timeout = Duration::from_millis(u64::from(capture_timeout_millis.clamp(1, 120_000)));
+    // This worker is deliberately both the armer and the waiter. On the
+    // affected Windows client, the old launch flow consumed an additional
+    // `CreateRemoteThread` for every status query after arming; the third one
+    // could be rejected with ERROR_ACCESS_DENIED even though LoadLibrary and
+    // the arm command had succeeded. A single second remote thread now owns
+    // the complete in-process bootstrap and reports one final snapshot.
+    if let Err(error) = unsafe { injected::windows::arm_d3d9_capture() } {
+        let snapshot = injected::windows::d3d9_capture_snapshot();
+        let mut report = launch_report(snapshot, RemoteLaunchOutcome::CaptureFailed);
+        report.capture_error = error.diagnostic_code();
+        return (RemoteLaunchOutcome::CaptureFailed, report);
+    }
     let deadline = Instant::now() + timeout;
     let snapshot = loop {
         let snapshot = injected::windows::d3d9_capture_snapshot();
@@ -424,6 +438,15 @@ unsafe fn launch_player_circle_worker(
             RemoteLaunchOutcome::CaptureFailed,
             launch_report(snapshot, RemoteLaunchOutcome::CaptureFailed),
         );
+    }
+
+    // Capture has copied all values needed for the runtime. Restore both
+    // early hooks before patching EndScene/Reset so normal D3D9 creation no
+    // longer depends on this bootstrap path for the rest of the session.
+    if let Err(error) = injected::windows::stop_d3d9_capture() {
+        let mut report = launch_report(snapshot, RemoteLaunchOutcome::CaptureCleanupFailed);
+        report.capture_error = error.diagnostic_code();
+        return (RemoteLaunchOutcome::CaptureCleanupFailed, report);
     }
 
     let configuration = RemoteGraphicsConfiguration {

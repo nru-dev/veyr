@@ -1,13 +1,13 @@
 {
   "schema_version": 1,
   "channel": "dev",
-  "source_commit": "54a5372f644be10d7eea1995941979ba6c393769",
+  "source_commit": "257d82dff681ef7242379b83596478169487ac54",
   "source_ref": "dev",
-  "source_tree": "clean",
+  "source_tree": "dirty",
   "target": "i686-pc-windows-gnu",
   "profile": "release",
   "artifacts": {
-    "veyr.dll": { "sha256": "972621b0de1e5957ffd5d23c3be7ea619ebb8dd16f7d064373d549c892cde968", "bytes": 1010688 },
-    "veyr.exe": { "sha256": "96dcd2455daae9892d7590cd31e3002d99b6abba22da4257e458cec1da536d2e", "bytes": 1079296 }
+    "veyr.dll": { "sha256": "c986c1735befb155c7d3f274bcc8c7177fa8054db391a655e8bacccf8e981da8", "bytes": 1012736 },
+    "veyr.exe": { "sha256": "0542e1246c6d700b734d0c7567ac392dde88e9e8312fbf77f17cf8819f01c679", "bytes": 1080320 }
   }
 }

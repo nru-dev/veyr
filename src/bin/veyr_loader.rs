@@ -522,25 +522,8 @@ mod windows_x86 {
         // armed, leaving the capture permanently idle.
         launched.resume()?;
         wait_for_loader_bootstrap(&process)?;
-        println!("Windows loader bootstrap is ready; arming D3D9 capture");
+        println!("Windows loader bootstrap is ready; starting D3D9 launch worker");
         let remote_module = inject(&process, &arguments.dll_path)?;
-        let remote_command_rva = local_module.export_rva(b"veyr_remote_command\0")?;
-        let remote_command = remote_module
-            .checked_add(remote_command_rva)
-            .ok_or_else(|| "remote command address overflowed x86 address space".to_owned())?;
-
-        let arm_result = call_remote(
-            &process,
-            remote_command,
-            RemoteCommand::ArmD3d9Capture as u32,
-        )?;
-        println!("D3D9 creation capture arm result: {arm_result}");
-        if arm_result != 0 {
-            print_d3d9_capture_error(arm_result);
-            return Err(format!(
-                "veyr.dll could not arm D3D9 creation capture (status {arm_result})"
-            ));
-        }
 
         let worker_rva = local_module.export_rva(b"veyr_remote_launch_player_circle\0")?;
         let worker_address = remote_module.checked_add(worker_rva).ok_or_else(|| {
@@ -618,6 +601,10 @@ mod windows_x86 {
                     "player circle startup failed with veyr status {}",
                     report.runtime_result
                 ))
+            }
+            value if value == RemoteLaunchOutcome::CaptureCleanupFailed as u32 => {
+                print_hook_error(report.capture_error);
+                Err("veyr.dll could not restore the temporary D3D9 capture hooks".to_owned())
             }
             value if value == RemoteLaunchOutcome::InvalidRequest as u32 => {
                 Err("veyr.dll rejected the private D3D9 launch request".to_owned())
