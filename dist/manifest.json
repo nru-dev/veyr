@@ -1,0 +1,9 @@
+{
+  "build_id": "258114b",
+  "tag": "circle-adaptive-checkpoint",
+  "target": "i686-pc-windows-gnu",
+  "artifacts": {
+    "veyr.dll": "16f5d43110dfc5c7d147057f2834880439b24464ff7a227c0bb3cfcf18b2ad17",
+    "veyr_loader.exe": "29d25b5a5ec5a39af72b382f6dea82b1cbe14b266b5700b5a799a040de2587c2"
+  }
+}

@@ -1,0 +1,10 @@
+.DS_Store
+# Only the current deliverables and explicit stable checkpoint are tracked.
+/dist/*.dll
+!/dist/veyr.dll
+/dist/*.exe
+!/dist/veyr_loader.exe
+/dist/stable/*
+!/dist/stable/veyr.dll
+!/dist/stable/veyr_loader.exe
+!/dist/stable/manifest.json
