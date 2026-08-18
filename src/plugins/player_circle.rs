@@ -9,7 +9,11 @@ use crate::offsets::api::{
     Color, Memory, PluginId, PluginRenderFrame, Position, Stroke, WorldCircleStyle,
 };
 
-/// Draws a terrain-following radius-20 circle around the current local player.
+/// Draws a smooth radius-20 circle around the current local player.
+///
+/// The renderer promotes this request to terrain/collision placement only
+/// after its native client profile has been explicitly validated; otherwise
+/// the circle remains a safe camera-projected static ring.
 #[derive(Debug, Default)]
 pub struct PlayerCirclePlugin {
     player_position: Option<Position>,

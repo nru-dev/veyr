@@ -51,12 +51,17 @@ pub struct Stroke {
 /// How a world circle is attached to the game world.
 ///
 /// `Static` keeps every sampled point at the supplied world height. `Dynamic`
-/// is a terrain-following circle: the native backend will place
-/// samples `terrain_clearance` units above the terrain. With
-/// `avoid_obstacles`, it also makes radial notches before static model/WMO
-/// collision and suppresses segments hidden behind world geometry. Sampling
-/// density scales with the radius inside the backend, so callers never need
-/// to guess an appropriate segment count.
+/// requests terrain-following placement: on a backend whose native collision
+/// profile has been validated, samples are placed `terrain_clearance` units
+/// above terrain. With `avoid_obstacles`, that validated backend may also make
+/// radial notches before static model/WMO collision and suppress segments
+/// hidden behind world geometry.
+///
+/// Collision profiles are deliberately fail-closed: if native collision is
+/// unavailable or not validated for the running client, the command falls back
+/// to the safe camera-projected static ring rather than invoking guessed game
+/// functions. Sampling density still scales with radius inside the backend, so
+/// callers never need to guess an appropriate segment count.
 #[derive(Debug, Copy, Clone, PartialEq)]
 pub enum WorldCirclePlacement {
     Static,
@@ -107,8 +112,8 @@ impl WorldCircleStyle {
         }
     }
 
-    /// A terrain-following outline. Each native sample is raised by
-    /// `terrain_clearance` world units above the hit terrain.
+    /// Requests a terrain-following outline. On an unsupported or unvalidated
+    /// native backend it safely falls back to a static outline.
     #[must_use]
     pub const fn terrain_outline(stroke: Stroke, terrain_clearance: f32) -> Self {
         Self {
@@ -122,9 +127,9 @@ impl WorldCircleStyle {
         }
     }
 
-    /// A terrain-following outline with collision-aware obstacle notches and
-    /// world-visibility culling. This is the appropriate dynamic style for a
-    /// radius indicator attached to a moving character.
+    /// Requests a terrain-following outline with obstacle notches and
+    /// world-visibility culling when the native collision profile has been
+    /// validated. Otherwise it safely renders as a static outline.
     #[must_use]
     pub const fn terrain_obstacle_outline(stroke: Stroke, terrain_clearance: f32) -> Self {
         Self {
