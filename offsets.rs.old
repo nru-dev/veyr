@@ -1,0 +1,439 @@
+//! Offsets and Enums for World of Warcraft 3.3.5a (Build 12340)
+//! Written for Rust memory reading/injection tools.
+
+pub mod wow {
+    // =========================================================================
+    // 1. Static Memory Addresses & Offsets
+    // =========================================================================
+    pub mod offsets {
+        // --- Global / Object Manager Addresses ---
+        pub const CLIENT_CONNECTION: usize     = 0x00C79CE0; // Pointer to ClientConnection
+        pub const OBJECT_MANAGER_OFFSET: usize = 0x2ED0;     // Offset from ClientConnection to ObjectManager
+        pub const FIRST_OBJECT: usize          = 0xAC;       // Offset from OM to First Object
+        pub const NEXT_OBJECT: usize           = 0x3C;       // Offset from Object to Next Object
+        pub const LOCAL_GUID: usize            = 0xC0;       // Offset from OM to Local Player GUID
+
+        // --- Object Structure Offsets ---
+        pub const DESCRIPTOR_ARRAY: usize      = 0x8;        // Pointer to Update Fields array
+        pub const OBJECT_TYPE: usize           = 0x14;       // Enum ObjectType (u32)
+
+        // --- Unit / Player Base Memory Offsets ---
+        pub const POINTER_TO_MOVEMENT: usize   = 0x10;       // Pointer to Movement Structure
+        pub const POSITION_X: usize            = 0x798;      // Float X
+        pub const POSITION_Y: usize            = 0x79C;      // Float Y
+        pub const POSITION_Z: usize            = 0x7A0;      // Float Z
+        pub const ROTATION: usize              = 0x7A4;      // Float Facing Angle (Radians)
+
+        // --- Click To Move (CTM) Offsets ---
+        pub const CTM_BASE: usize              = 0x00CA11D8; // Base address for CTM
+        pub const CTM_ACTION_TYPE: usize       = 0x00CA11D8; // u32 (4 = Move, 5 = NPC, 6 = Loot, etc.)
+        pub const CTM_X: usize                 = 0x00CA11DC; // Float Target X
+        pub const CTM_Y: usize                 = 0x00CA11E0; // Float Target Y
+        pub const CTM_Z: usize                 = 0x00CA11E4; // Float Target Z
+        pub const CTM_TARGET_GUID: usize       = 0x00CA11C8; // u64 Target GUID
+        pub const CTM_DISTANCE: usize          = 0x00CA11CC; // Float Precision / Stop Distance
+
+        // --- Game World & UI State ---
+        pub const IS_INGAME: usize             = 0x00B6A9E0; // u32/bool (1 = In Game)
+        pub const REALM_NAME: usize            = 0x00C79D18; // String
+        pub const SPELL_COOLDOWN_PTR: usize    = 0x00CECAEC; // Pointer to spell cooldown linked list
+    }
+
+    // =========================================================================
+    // 2. Native Functions Addresses
+    // =========================================================================
+    pub mod functions {
+        pub const FRAMESCRIPT_EXECUTE: usize   = 0x00819210; // DoString / Exec LUA
+        pub const FRAMESCRIPT_GETTEXT: usize   = 0x007040D0; // Get LUA Var Value
+        pub const CGPLAYER_C_CLICK_TO_MOVE: usize = 0x00611130; // CTM Function call
+        pub const CGUNIT_C_SET_TARGET: usize   = 0x00523A40; // Set Target
+        pub const WORLD_TO_SCREEN: usize       = 0x007A3B70; // W2S (World position -> 2D Screen coords)
+    }
+
+    // =========================================================================
+    // 3. Object Types
+    // =========================================================================
+    #[repr(u32)]
+    #[derive(Debug, Copy, Clone, PartialEq, Eq)]
+    pub enum ObjectType {
+        Object        = 0,
+        Item          = 1,
+        Container     = 2,
+        Unit          = 3, // NPCs, Monsters, Pets
+        Player        = 4, // Players
+        GameObject    = 5, // Chests, Nodes, Doors
+        DynamicObject = 6, // Spells on ground (AOE)
+        Corpse        = 7,
+        AreaTrigger   = 8,
+        SceneObject   = 9,
+    }
+
+    // =========================================================================
+    // 4. Click To Move Action Types
+    // =========================================================================
+    #[repr(u32)]
+    #[derive(Debug, Copy, Clone, PartialEq, Eq)]
+    pub enum CtmActionType {
+        None          = 0,
+        FaceTarget    = 1,
+        FaceLocation  = 2,
+        Move          = 4,
+        NpcInteract   = 5,
+        Loot          = 6,
+        ObjInteract   = 7,
+        AttackGuided  = 8,
+        AttackPosition= 9,
+        AttackUnk     = 10,
+        Follow        = 11,
+    }
+
+    // =========================================================================
+    // 5. Update Fields / Descriptors
+    // =========================================================================
+
+    /// Common Object Fields (Shared across ALL world objects)
+    #[repr(u32)]
+    #[derive(Debug, Copy, Clone, PartialEq, Eq)]
+    pub enum ObjectFields {
+        Guid     = 0x0, // 64-bit GUID (Spans 0x0 and 0x1)
+        Type     = 0x2, // Type flags
+        Entry    = 0x3, // Entry ID (Template ID)
+        ScaleX   = 0x4, // Scale
+        End      = 0x5,
+    }
+
+    /// Item Descriptor Fields
+    #[repr(u32)]
+    #[derive(Debug, Copy, Clone, PartialEq, Eq)]
+    pub enum ItemFields {
+        Owner               = ObjectFields::End as u32 + 0x0, // 64-bit
+        Contained           = ObjectFields::End as u32 + 0x2, // 64-bit
+        Creator             = ObjectFields::End as u32 + 0x4, // 64-bit
+        GiftCreator         = ObjectFields::End as u32 + 0x6, // 64-bit
+        StackCount          = ObjectFields::End as u32 + 0x8,
+        Duration            = ObjectFields::End as u32 + 0x9,
+        SpellCharges        = ObjectFields::End as u32 + 0xA,
+        Flags               = ObjectFields::End as u32 + 0xF,
+        Enchantment         = ObjectFields::End as u32 + 0x10,
+        PropertySeed        = ObjectFields::End as u32 + 0x31,
+        RandomPropertiesId  = ObjectFields::End as u32 + 0x32,
+        Durability          = ObjectFields::End as u32 + 0x33,
+        MaxDurability       = ObjectFields::End as u32 + 0x34,
+        CreatePlayedTime    = ObjectFields::End as u32 + 0x35,
+        End                 = ObjectFields::End as u32 + 0x36,
+    }
+
+    /// Container Descriptor Fields
+    #[repr(u32)]
+    #[derive(Debug, Copy, Clone, PartialEq, Eq)]
+    pub enum ContainerFields {
+        NumSlots            = ItemFields::End as u32 + 0x0,
+        Slots               = ItemFields::End as u32 + 0x1, // Array of 36 items (64-bit GUIDs)
+        End                 = ItemFields::End as u32 + 0x49,
+    }
+
+    /// Unit Descriptor Fields (Base for Monsters, Players, Pets, NPCs)
+    #[repr(u32)]
+    #[derive(Debug, Copy, Clone, PartialEq, Eq)]
+    pub enum UnitFields {
+        Charm               = ObjectFields::End as u32 + 0x0,  // 64-bit
+        Summon              = ObjectFields::End as u32 + 0x2,  // 64-bit
+        Critter             = ObjectFields::End as u32 + 0x4,  // 64-bit
+        CharmedBy           = ObjectFields::End as u32 + 0x6,  // 64-bit
+        SummonedBy          = ObjectFields::End as u32 + 0x8,  // 64-bit
+        CreatedBy           = ObjectFields::End as u32 + 0xA,  // 64-bit
+        Target              = ObjectFields::End as u32 + 0xC,  // 64-bit Target GUID
+        ChannelObject       = ObjectFields::End as u32 + 0xE,  // 64-bit
+        ChannelSpell        = ObjectFields::End as u32 + 0x10,
+        Bytes0              = ObjectFields::End as u32 + 0x11, // Race, Class, Gender, PowerType
+        Health              = ObjectFields::End as u32 + 0x12,
+        Power1              = ObjectFields::End as u32 + 0x13, // Mana
+        Power2              = ObjectFields::End as u32 + 0x14, // Rage
+        Power3              = ObjectFields::End as u32 + 0x15, // Focus
+        Power4              = ObjectFields::End as u32 + 0x16, // Energy
+        Power5              = ObjectFields::End as u32 + 0x17, // Happiness
+        Power6              = ObjectFields::End as u32 + 0x18, // Runic Power
+        MaxHealth           = ObjectFields::End as u32 + 0x19,
+        MaxPower1           = ObjectFields::End as u32 + 0x1A, // Max Mana
+        MaxPower2           = ObjectFields::End as u32 + 0x1B, // Max Rage
+        MaxPower3           = ObjectFields::End as u32 + 0x1C, // Max Focus
+        MaxPower4           = ObjectFields::End as u32 + 0x1D, // Max Energy
+        MaxPower5           = ObjectFields::End as u32 + 0x1E, // Max Happiness
+        MaxPower6           = ObjectFields::End as u32 + 0x1F, // Max Runic Power
+        Level               = ObjectFields::End as u32 + 0x20,
+        FactionTemplate     = ObjectFields::End as u32 + 0x21,
+        VirtualItemSlotId   = ObjectFields::End as u32 + 0x22,
+        Flags               = ObjectFields::End as u32 + 0x25, // Unit Flags (PvP, In Combat, Passive, etc.)
+        Flags2              = ObjectFields::End as u32 + 0x26,
+        AuraState           = ObjectFields::End as u32 + 0x27,
+        BaseAttackTime      = ObjectFields::End as u32 + 0x28,
+        OffhandAttackTime   = ObjectFields::End as u32 + 0x29,
+        RangedAttackTime    = ObjectFields::End as u32 + 0x2A,
+        BoundingRadius      = ObjectFields::End as u32 + 0x2B, // Float
+        CombatReach         = ObjectFields::End as u32 + 0x2C, // Float
+        DisplayId           = ObjectFields::End as u32 + 0x2D,
+        NativeDisplayId     = ObjectFields::End as u32 + 0x2E,
+        MountDisplayId      = ObjectFields::End as u32 + 0x2F,
+        MinDamage           = ObjectFields::End as u32 + 0x30, // Float
+        MaxDamage           = ObjectFields::End as u32 + 0x31, // Float
+        MinOffhandDamage    = ObjectFields::End as u32 + 0x32, // Float
+        MaxOffhandDamage    = ObjectFields::End as u32 + 0x33, // Float
+        Bytes1              = ObjectFields::End as u32 + 0x34, // StandState, VisFlags, AnimTier
+        PetNumber           = ObjectFields::End as u32 + 0x35,
+        PetNameTimestamp    = ObjectFields::End as u32 + 0x36,
+        PetExperience       = ObjectFields::End as u32 + 0x37,
+        PetNextLevelExp     = ObjectFields::End as u32 + 0x38,
+        DynamicFlags        = ObjectFields::End as u32 + 0x39,
+        ModCastSpeed        = ObjectFields::End as u32 + 0x3A, // Float
+        CreatedBySpell      = ObjectFields::End as u32 + 0x3B,
+        NpcFlags            = ObjectFields::End as u32 + 0x3C, // Vendor, Questgiver, Flightmaster flags
+        NpcEmoteState       = ObjectFields::End as u32 + 0x3D,
+        Stat0               = ObjectFields::End as u32 + 0x3E, // Strength
+        Stat1               = ObjectFields::End as u32 + 0x3F, // Agility
+        Stat2               = ObjectFields::End as u32 + 0x40, // Stamina
+        Stat3               = ObjectFields::End as u32 + 0x41, // Intellect
+        Stat4               = ObjectFields::End as u32 + 0x42, // Spirit
+        TargetPoison        = ObjectFields::End as u32 + 0x43,
+        End                 = ObjectFields::End as u32 + 0x8C,
+    }
+
+    /// Player Descriptor Fields (Extends UnitFields)
+    #[repr(u32)]
+    #[derive(Debug, Copy, Clone, PartialEq, Eq)]
+    pub enum PlayerFields {
+        DuelArbitrator      = UnitFields::End as u32 + 0x0,  // 64-bit
+        Flags               = UnitFields::End as u32 + 0x2,
+        GuildId             = UnitFields::End as u32 + 0x3,
+        GuildRank           = UnitFields::End as u32 + 0x4,
+        Bytes               = UnitFields::End as u32 + 0x5,  // Skin, Face, HairStyle, HairColor
+        Bytes2              = UnitFields::End as u32 + 0x6,  // FacialHair, RestState
+        Bytes3              = UnitFields::End as u32 + 0x7,  // Gender, ArenaFaction
+        DuelTeam            = UnitFields::End as u32 + 0x8,
+        GuildTimestamp      = UnitFields::End as u32 + 0x9,
+        QuestLog            = UnitFields::End as u32 + 0xA,  // Quest log array
+        VisibleItems        = UnitFields::End as u32 + 0x1FA, // Inventory / Equipped gear display
+        ChosenTitle         = UnitFields::End as u32 + 0x2B2,
+        FakeInebriation     = UnitFields::End as u32 + 0x2B3,
+        ArenaCurrency       = UnitFields::End as u32 + 0x2B4,
+        HonorCurrency       = UnitFields::End as u32 + 0x2B5,
+        End                 = UnitFields::End as u32 + 0x4A8,
+    }
+
+    /// GameObject Descriptor Fields (Nodes, Doors, Chests)
+    #[repr(u32)]
+    #[derive(Debug, Copy, Clone, PartialEq, Eq)]
+    pub enum GameObjectFields {
+        CreatedBy           = ObjectFields::End as u32 + 0x0, // 64-bit
+        DisplayId           = ObjectFields::End as u32 + 0x2,
+        Flags               = ObjectFields::End as u32 + 0x3,
+        ParentRotation      = ObjectFields::End as u32 + 0x4, // Quaternion (4 floats)
+        Dynamic             = ObjectFields::End as u32 + 0x8,
+        Faction             = ObjectFields::End as u32 + 0x9,
+        Level               = ObjectFields::End as u32 + 0xA,
+        Bytes1              = ObjectFields::End as u32 + 0xB,
+        End                 = ObjectFields::End as u32 + 0xC,
+    }
+}
+
+pub mod rotation_extras {
+    // =========================================================================
+    // 1. Специфичные оффсеты ротации
+    // =========================================================================
+    pub mod offsets {
+        // Таблица кулдаунов спеллов
+        pub const SPELL_COOLDOWN_PTR: usize    = 0x00CECAEC; 
+        
+        // D3D9 Device VTable Pointer (для EndScene хука)
+        pub const D3D9_DEVICE_PTR: usize       = 0x00C5DF88;
+        pub const D3D9_DEVICE_OFFSET: usize    = 0x3960;
+        pub const ENDSCENE_VTABLE_INDEX: usize = 42;
+
+        // Поля каста внутри Unit Base
+        pub const IS_CASTING_SPELL_ID: usize   = 0xC89; // u32 Current Cast Spell ID
+        pub const MOVEMENT_STRUCT: usize       = 0x10;  // Pointer to movement
+    }
+
+    // =========================================================================
+    // 2. Дополнительные нативные функции
+    // =========================================================================
+    pub mod functions {
+        // Проверка Line of Sight (Видит ли игрок цель)
+        pub const TRACELINE: usize             = 0x007A5640; 
+        
+        // Получение имени игрока по GUID из кэша
+        pub const GET_PLAYER_NAME_BY_GUID: usize = 0x00723D40; 
+        
+        // Spell Book / Spell Info
+        pub const GET_SPELL_COOL_DOWN: usize   = 0x006E13E0;
+    }
+
+    // Структурная нода списка кулдаунов
+    #[repr(C)]
+    pub struct SpellCooldownEntry {
+        pub next: *const SpellCooldownEntry,
+        pub unk0: usize,
+        pub spell_id: u32,
+        pub item_id: u32,
+        pub start_time: u32,  // GetTickCount()
+        pub duration: u32,    // ms
+    }
+}
+
+pub mod spell_dbc {
+    pub const SPELL_STORE: usize = 0x00C0D780; // Pointer to DBC Storage
+
+    // Упрощенная структура SpellEntry для 3.3.5a (билд 12340)
+    #[repr(C)]
+    pub struct SpellEntry {
+        pub id: u32,                        // 0x00
+        pub category: u32,                  // 0x04
+        pub cast_ui: u32,                    // 0x08
+        pub dispel_type: u32,               // 0x0C
+        pub mechanic: u32,                  // 0x10
+        pub attributes: u32,                // 0x14
+        pub attributes_ex1: u32,            // 0x18
+        // ... пропущенные флаги ...
+        pub targets: u32,                   // 0x64
+        pub target_creature_type: u32,      // 0x68
+        pub requires_spell_focus: u32,      // 0x6C
+        pub facing_caster_flags: u32,       // 0x70
+        pub caster_aura_state: u32,         // 0x74
+        pub target_aura_state: u32,         // 0x78
+        pub casting_time_index: u32,        // 0x7C
+        pub recovery_time: u32,             // 0x80
+        pub category_recovery_time: u32,    // 0x84
+        pub interrupt_flags: u32,           // 0x88
+        pub aura_interrupt_flags: u32,      // 0x8C
+        pub channel_interrupt_flags: u32,   // 0x90
+        pub proc_flags: u32,                // 0x94
+        pub proc_chance: u32,               // 0x98
+        pub proc_charges: u32,              // 0x9C
+        pub max_level: u32,                 // 0xA0
+        pub base_level: u32,                // 0xA4
+        pub spell_level: u32,               // 0xA8 - УРОВЕНЬ ЗАКЛИНАНИЯ
+        pub duration_index: u32,            // 0xAC
+        pub power_type: u32,                // 0xB0 - 0 = Mana, 1 = Rage, 3 = Energy и т.д.
+        pub mana_cost: u32,                 // 0xB4 - Базовая стоимость
+        pub mana_cost_per_level: u32,       // 0xB8
+        pub mana_per_second: u32,           // 0xBC
+        pub range_index: u32,               // 0xC0 - Индекс дистанции
+        pub speed: f32,                     // 0xC4 - Скорость снаряда
+        // ...
+        pub name_ptr: [usize; 16],          // 0x13C - Массив указателей на имена на разных языках
+        pub rank_ptr: [usize; 16],          // 0x17C - Массив указателей на ранги ("Rank 1", "Rank 2")
+    }
+}
+
+
+
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct AuraEntry {
+    pub creator_guid: u64, // GUID того, кто повесил бафф (игрок или моб)
+    pub spell_id: u32,     // ID спелла ауры
+    pub flags: u8,        // Флаги (дебафф/бафф, можно ли задиспелить)
+    pub level: u8,        // Уровень кастера
+    pub stack_count: u8,  // КОЛИЧЕСТВО СТАКОВ (например, 5 стаков Sunder Armor)
+    pub unk: u8,
+    pub duration: i32,    // Полная длительность (мс)
+    pub end_time: i32,    // Время окончания (сравнивается с GetTickCount)
+}
+
+pub mod rotation_extras_v2 {
+    use super::wow::ObjectType;
+
+    // =========================================================================
+    // 1. Камера и Матрицы (для ESP / D3D Overlay без вызова нативного W2S)
+    // =========================================================================
+    pub mod camera {
+        pub const CAMERA_POINTER: usize = 0x00B4B324; // Pointer to Camera Base
+        pub const CAMERA_OFFSET: usize  = 0x650;      // Offset to WorldCamera struct
+
+        #[repr(C)]
+        pub struct Vector3 {
+            pub x: f32,
+            pub y: f32,
+            pub z: f32,
+        }
+
+        #[repr(C)]
+        pub struct WorldCamera {
+            pub unk0: [u8; 0x8],
+            pub pos: Vector3,           // 0x08 - Координаты глаз
+            pub view_matrix: [[f32; 3]; 3], // 0x14 - Матрица вращения
+            pub fov: f32,               // 0x38 - Field of View
+            pub near_clip: f32,         // 0x3C
+            pub far_clip: f32,          // 0x40
+            pub aspect_ratio: f32,      // 0x44
+        }
+    }
+
+    // =========================================================================
+    // 2. Тайминги Каста Цели (для Авто-Киков / Interrupt Bot)
+    // =========================================================================
+    pub mod casting {
+        // Указатель на структуру текущего каста внутри Unit Base
+        pub const SPELL_CAST_STRUCT_PTR: usize = 0xA8;
+
+        #[repr(C)]
+        pub struct SpellCastInfo {
+            pub unk0: usize,
+            pub spell_id: u32,        // 0x04 - ID кастуемого спелла
+            pub cast_start_time: u32, // 0x08 - Время начала (GetTickCount)
+            pub cast_end_time: u32,   // 0x0C - Время окончания (GetTickCount)
+            pub is_channeling: u8,    // 0x10 - Потоковое ли заклинание
+        }
+    }
+
+    // =========================================================================
+    // 3. Динамический Массив Аур (для Рейдов >40 баффов)
+    // =========================================================================
+    pub mod auras_extended {
+        pub const BASE_AURA_COUNT: usize      = 0xDD0; // u32 (Количество аур)
+        pub const BASE_AURA_ARRAY: usize      = 0xC50; // Массив первых 40 аур (AuraEntry)
+        pub const DYNAMIC_AURA_POINTER: usize = 0xDD8; // Pointer to AuraEntry array (если аур > 40)
+    }
+
+    // =========================================================================
+    // 4. GameObjects (Взаимодействие с рудой, сундуками, объектами)
+    // =========================================================================
+    pub mod game_objects {
+        // Нативные функции
+        pub const CGGAMEOBJECT_C_INTERACT: usize = 0x005E2B90; // Клик по объекту
+        pub const GET_GAMEOBJECT_NAME: usize     = 0x00702850; // Получить имя ГО по Entry
+
+        // Поля состояния объекта
+        pub const GAMEOBJECT_STATE: usize        = 0x1C; // u8 State (0 = Ready, 1 = Active/Opened)
+    }
+
+    // =========================================================================
+    // 5. Угроза / Агро (Threat Management)
+    // =========================================================================
+    pub mod threat {
+        pub const CGUNIT_C_GET_THREAT_STATE: usize = 0x00525D50;
+
+        #[repr(u32)]
+        #[derive(Debug, Copy, Clone, PartialEq, Eq)]
+        pub enum ThreatState {
+            Low           = 0, // Безопасно
+            HigherThanTank = 1, // Скоро сорвёшь
+            Highest       = 2, // Первое место по угрозе
+            Tanking       = 3, // Цель атакована тобой
+        }
+    }
+}
+pub mod wotlk_rotations_extras {
+    pub mod offsets {
+        // Комбо-поинты (Rogue / Cat Druid) - 1 байт (u8)
+        pub const COMBO_POINTS: usize          = 0x00BD084D; 
+
+        // Mouseover GUID (GUID объекта, на который наведена мышка)
+        pub const MOUSEOVER_GUID: usize        = 0x00BD07B0; 
+
+        // Focus Target GUID (GUID фокус-цели)
+        pub const FOCUS_GUID: usize            = 0x00BD0780;
+
+        // Auto Attack State (Атакует ли персонаж авто-атакой прямо сейчас)
+        pub const IS_AUTO_ATTACKING: usize     = 0x00C79D50;
+    }
+}

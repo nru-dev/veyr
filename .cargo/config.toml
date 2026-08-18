@@ -1,0 +1,5 @@
+# The game client and loader are 32-bit Windows binaries.  Build their
+# known-good GNU variant; the wrapper translates rustc's GNU link arguments
+# for the bundled macOS Zig linker.
+[target.i686-pc-windows-gnu]
+linker = "scripts/zig-cc-i686-windows.sh"
