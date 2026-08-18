@@ -1,9 +1,13 @@
 {
-  "build_id": "258114b",
-  "tag": "circle-adaptive-checkpoint",
+  "schema_version": 1,
+  "channel": "dev",
+  "source_commit": "90121ea7a65ca0b87d9f97cc0895735569c33c11",
+  "source_ref": "dev",
+  "source_tree": "clean",
   "target": "i686-pc-windows-gnu",
+  "profile": "release",
   "artifacts": {
-    "veyr.dll": "16f5d43110dfc5c7d147057f2834880439b24464ff7a227c0bb3cfcf18b2ad17",
-    "veyr_loader.exe": "29d25b5a5ec5a39af72b382f6dea82b1cbe14b266b5700b5a799a040de2587c2"
+    "veyr.dll": { "sha256": "8138d82d58c66c5f8a2e21373c5578ccd05f2eed7f1364c6faf1299fc24e0517", "bytes": 1011200 },
+    "veyr_loader.exe": { "sha256": "71676b79be1db727840facd1c6d03668dd831098071cc4abcf6ceeaa1c8dca8e", "bytes": 1077760 }
   }
 }
