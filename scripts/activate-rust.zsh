@@ -85,7 +85,7 @@ veyr_write_artifact_manifest() {
         '  "profile": "release",' \
         '  "artifacts": {' \
         "    \"veyr.dll\": { \"sha256\": \"$dll_sha\", \"bytes\": $dll_bytes }," \
-        "    \"veyr_loader.exe\": { \"sha256\": \"$loader_sha\", \"bytes\": $loader_bytes }" \
+        "    \"veyr.exe\": { \"sha256\": \"$loader_sha\", \"bytes\": $loader_bytes }" \
         '  }' \
         '}' > "$manifest_path"
 }
@@ -126,7 +126,7 @@ veyr_build_windows() {
             cargo build --release --target i686-pc-windows-gnu "$@"
     ) || return
 
-    if [[ ! -f "$build_dir/veyr.dll" || ! -f "$build_dir/veyr_loader.exe" ]]; then
+    if [[ ! -f "$build_dir/veyr.dll" || ! -f "$build_dir/veyr.exe" ]]; then
         print -u2 "Windows build completed without both release deliverables"
         return 1
     fi
@@ -138,22 +138,22 @@ veyr_build_windows() {
     fi
 
     cp "$build_dir/veyr.dll" "$stage_dir/veyr.dll" || return
-    cp "$build_dir/veyr_loader.exe" "$stage_dir/veyr_loader.exe" || return
+    cp "$build_dir/veyr.exe" "$stage_dir/veyr.exe" || return
     veyr_assert_windows_x86_artifact "$stage_dir/veyr.dll" || return
-    veyr_assert_windows_x86_artifact "$stage_dir/veyr_loader.exe" || return
+    veyr_assert_windows_x86_artifact "$stage_dir/veyr.exe" || return
     veyr_write_artifact_manifest \
         "$stage_dir/manifest.json" \
         "$source_commit" \
         "$source_ref" \
         "$source_tree" \
         "$stage_dir/veyr.dll" \
-        "$stage_dir/veyr_loader.exe" || return
+        "$stage_dir/veyr.exe" || return
 
     # Publish only after both copies have succeeded, so dist/ never contains
     # an unverified binary. The manifest is published last: it is the
     # provenance record for the exact DLL/loader pair currently in dist/.
     mv -f "$stage_dir/veyr.dll" "$output_dir/veyr.dll"
-    mv -f "$stage_dir/veyr_loader.exe" "$output_dir/veyr_loader.exe"
+    mv -f "$stage_dir/veyr.exe" "$output_dir/veyr.exe"
     mv -f "$stage_dir/manifest.json" "$output_dir/manifest.json"
     rmdir "$stage_dir" 2>/dev/null || true
 }

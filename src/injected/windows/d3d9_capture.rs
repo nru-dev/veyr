@@ -55,10 +55,11 @@ pub struct D3d9CaptureSnapshot {
 }
 
 type Direct3dCreate9Fn = unsafe extern "system" fn(sdk_version: u32) -> *mut c_void;
-/// `IDirect3D9::CreateDevice` is a COM `STDMETHODCALLTYPE` method. On the
-/// supported x86 target this is `__stdcall`: `this` is the first stack
-/// argument and the callee pops all seven words. It is not a C++
-/// `__thiscall` member-function call.
+/// `IDirect3D9::CreateDevice` is a COM `STDMETHODCALLTYPE` method. On x86
+/// this is `__stdcall`: the interface pointer and six documented arguments
+/// are all stack arguments, and the callee pops seven words. Do not use Rust
+/// `thiscall` here just because the native caller was compiled from C++; the
+/// vtable ABI is COM, not an ordinary C++ member-function ABI.
 type CreateDeviceFn = unsafe extern "system" fn(
     factory: *mut c_void,
     adapter: u32,

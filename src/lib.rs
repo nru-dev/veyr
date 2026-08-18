@@ -80,6 +80,98 @@ pub struct RemoteGraphicsConfiguration {
     pub d3d9_device: u32,
 }
 
+/// Version of the one-shot startup-worker request shared by `veyr.exe` and
+/// `veyr.dll`.
+///
+/// This is intentionally a word-only `repr(C)` structure: the loader writes
+/// it into the target before creating one worker thread, and reads the final
+/// report only after that thread exits. It is not a public plugin ABI.
+pub const REMOTE_LAUNCH_ABI_VERSION: u32 = 1;
+
+/// Final result written by [`RemoteLaunchRequest`] before its worker exits.
+#[repr(u32)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum RemoteLaunchOutcome {
+    /// The worker has not produced a final result yet.
+    Pending = 0,
+    /// D3D9 was captured and the requested runtime started.
+    Started = 1,
+    /// The loader supplied an invalid request pointer or ABI version.
+    InvalidRequest = 2,
+    /// Early D3D9 capture itself reported a failure.
+    CaptureFailed = 3,
+    /// No D3D9 device was observed before the bounded worker deadline.
+    CaptureTimedOut = 4,
+    /// The captured targets were rejected before a runtime hook was installed.
+    ConfigurationFailed = 5,
+    /// The runtime rejected or failed to install its native hooks.
+    RuntimeStartFailed = 6,
+    /// A Rust panic was contained at the private worker ABI boundary.
+    Panicked = 7,
+}
+
+/// Diagnostics for the one-shot player-circle startup worker.
+///
+/// All fields are `u32` so this stays layout-compatible with the 32-bit
+/// Windows loader even when unit-tested on a 64-bit development machine.
+#[repr(C)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub struct RemoteLaunchReport {
+    pub abi_version: u32,
+    pub outcome: u32,
+    pub capture_state: u32,
+    pub capture_error: u32,
+    pub factory_calls: u32,
+    pub create_device_calls: u32,
+    pub device: u32,
+    pub end_scene: u32,
+    pub reset: u32,
+    pub configuration_result: u32,
+    pub runtime_result: u32,
+    pub hook_error: u32,
+}
+
+impl RemoteLaunchReport {
+    #[must_use]
+    pub const fn pending() -> Self {
+        Self {
+            abi_version: REMOTE_LAUNCH_ABI_VERSION,
+            outcome: RemoteLaunchOutcome::Pending as u32,
+            capture_state: 0,
+            capture_error: 0,
+            factory_calls: 0,
+            create_device_calls: 0,
+            device: 0,
+            end_scene: 0,
+            reset: 0,
+            configuration_result: 0,
+            runtime_result: 0,
+            hook_error: 0,
+        }
+    }
+}
+
+/// Input and completion storage for one private startup worker.
+#[repr(C)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub struct RemoteLaunchRequest {
+    pub abi_version: u32,
+    /// Bounded wait for `Direct3DCreate9/CreateDevice`, in milliseconds.
+    pub capture_timeout_millis: u32,
+    pub report: RemoteLaunchReport,
+}
+
+impl RemoteLaunchRequest {
+    #[must_use]
+    pub const fn player_circle(capture_timeout_millis: u32) -> Self {
+        Self {
+            abi_version: REMOTE_LAUNCH_ABI_VERSION,
+            capture_timeout_millis,
+            report: RemoteLaunchReport::pending(),
+        }
+    }
+}
+
 /// Thread-entry-compatible bootstrap for the selected native graphics backend.
 ///
 /// Return values: `0` success, `1` runtime already running, `2` invalid ABI,
@@ -249,6 +341,152 @@ pub extern "system" fn veyr_d3d9_capture_reset() -> u32 {
 #[no_mangle]
 pub extern "system" fn veyr_d3d9_capture_error() -> u32 {
     injected::windows::d3d9_capture_snapshot().error
+}
+
+/// Waits inside the injected process for the early D3D9 capture, then starts
+/// the player-circle runtime from its captured live device targets.
+///
+/// The loader creates this one worker *before* it releases WoW's startup
+/// gate. It therefore never has to create a fresh remote thread for every
+/// diagnostic poll while the client is entering graphics initialization.
+/// The request allocation must stay valid until this function returns.
+#[cfg(all(windows, target_arch = "x86"))]
+#[no_mangle]
+pub unsafe extern "system" fn veyr_remote_launch_player_circle(
+    parameter: *mut core::ffi::c_void,
+) -> u32 {
+    use core::ptr;
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+
+    let request = parameter.cast::<RemoteLaunchRequest>();
+    if request.is_null() {
+        return RemoteLaunchOutcome::InvalidRequest as u32;
+    }
+
+    // This has the same caller-owned-pointer contract as the existing remote
+    // graphics configuration export. Read it once before the worker begins.
+    let input = unsafe { ptr::read_unaligned(request) };
+    if input.abi_version != REMOTE_LAUNCH_ABI_VERSION {
+        let mut report = RemoteLaunchReport::pending();
+        report.outcome = RemoteLaunchOutcome::InvalidRequest as u32;
+        unsafe { write_remote_launch_report(request, report) };
+        return report.outcome;
+    }
+
+    match catch_unwind(AssertUnwindSafe(|| unsafe {
+        launch_player_circle_worker(request, input.capture_timeout_millis)
+    })) {
+        Ok((outcome, report)) => {
+            unsafe { write_remote_launch_report(request, report) };
+            outcome as u32
+        }
+        Err(_) => {
+            let mut report = RemoteLaunchReport::pending();
+            report.outcome = RemoteLaunchOutcome::Panicked as u32;
+            unsafe { write_remote_launch_report(request, report) };
+            RemoteLaunchOutcome::Panicked as u32
+        }
+    }
+}
+
+#[cfg(all(windows, target_arch = "x86"))]
+unsafe fn launch_player_circle_worker(
+    _request: *mut RemoteLaunchRequest,
+    capture_timeout_millis: u32,
+) -> (RemoteLaunchOutcome, RemoteLaunchReport) {
+    use std::thread::sleep;
+    use std::time::{Duration, Instant};
+
+    // The loader owns the outer deadline too. Clamp the in-process wait so a
+    // malformed request can never leave a remote worker alive indefinitely.
+    let timeout = Duration::from_millis(u64::from(capture_timeout_millis.clamp(1, 120_000)));
+    let deadline = Instant::now() + timeout;
+    let snapshot = loop {
+        let snapshot = injected::windows::d3d9_capture_snapshot();
+        match snapshot.state {
+            injected::windows::D3d9CaptureState::DeviceCaptured
+            | injected::windows::D3d9CaptureState::Failed => break snapshot,
+            injected::windows::D3d9CaptureState::Idle
+            | injected::windows::D3d9CaptureState::Armed
+            | injected::windows::D3d9CaptureState::FactoryObserved => {
+                if Instant::now() >= deadline {
+                    let mut report = launch_report(snapshot, RemoteLaunchOutcome::CaptureTimedOut);
+                    report.hook_error = veyr_runtime_last_hook_error();
+                    return (RemoteLaunchOutcome::CaptureTimedOut, report);
+                }
+                sleep(Duration::from_millis(10));
+            }
+        }
+    };
+
+    if snapshot.state == injected::windows::D3d9CaptureState::Failed {
+        return (
+            RemoteLaunchOutcome::CaptureFailed,
+            launch_report(snapshot, RemoteLaunchOutcome::CaptureFailed),
+        );
+    }
+
+    let configuration = RemoteGraphicsConfiguration {
+        abi_version: GRAPHICS_CONFIGURATION_ABI_VERSION,
+        backend: GRAPHICS_BACKEND_D3D9,
+        frame_target: snapshot.targets.end_scene,
+        auxiliary_target: snapshot.targets.reset,
+        d3d9_device: snapshot.device,
+    };
+    let configuration_result = unsafe {
+        veyr_remote_configure_graphics(
+            core::ptr::addr_of!(configuration)
+                .cast_mut()
+                .cast::<core::ffi::c_void>(),
+        )
+    };
+    if configuration_result != 0 {
+        let mut report = launch_report(snapshot, RemoteLaunchOutcome::ConfigurationFailed);
+        report.configuration_result = configuration_result;
+        report.hook_error = veyr_runtime_last_hook_error();
+        return (RemoteLaunchOutcome::ConfigurationFailed, report);
+    }
+
+    let runtime_result = veyr_runtime_start_player_circle();
+    let outcome = if runtime_result == 0 {
+        RemoteLaunchOutcome::Started
+    } else {
+        RemoteLaunchOutcome::RuntimeStartFailed
+    };
+    let mut report = launch_report(snapshot, outcome);
+    report.configuration_result = configuration_result;
+    report.runtime_result = runtime_result;
+    report.hook_error = veyr_runtime_last_hook_error();
+    (outcome, report)
+}
+
+#[cfg(all(windows, target_arch = "x86"))]
+fn launch_report(
+    snapshot: injected::windows::D3d9CaptureSnapshot,
+    outcome: RemoteLaunchOutcome,
+) -> RemoteLaunchReport {
+    RemoteLaunchReport {
+        abi_version: REMOTE_LAUNCH_ABI_VERSION,
+        outcome: outcome as u32,
+        capture_state: snapshot.state as u32,
+        capture_error: snapshot.error,
+        factory_calls: snapshot.factory_calls,
+        create_device_calls: snapshot.create_device_calls,
+        device: snapshot.device,
+        end_scene: snapshot.targets.end_scene,
+        reset: snapshot.targets.reset,
+        configuration_result: 0,
+        runtime_result: 0,
+        hook_error: 0,
+    }
+}
+
+#[cfg(all(windows, target_arch = "x86"))]
+unsafe fn write_remote_launch_report(
+    request: *mut RemoteLaunchRequest,
+    report: RemoteLaunchReport,
+) {
+    unsafe { core::ptr::addr_of_mut!((*request).report).write(report) };
 }
 
 /// Explicitly starts the minimal injected runtime after `LoadLibrary`.

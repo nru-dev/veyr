@@ -3,7 +3,12 @@ name = "veyr"
 version = "0.0.0"
 edition = "2021"
 publish = false
+autobins = false
 
 [lib]
 path = "src/lib.rs"
 crate-type = ["rlib", "cdylib"]
+
+[[bin]]
+name = "veyr"
+path = "src/bin/veyr_loader.rs"

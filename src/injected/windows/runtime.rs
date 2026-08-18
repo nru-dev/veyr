@@ -305,6 +305,10 @@ struct ActiveRuntime {
     runtime: Box<dyn FrameRuntime>,
 }
 
+// `ACTIVE_RUNTIME` is initialized before either entry patch is made visible.
+// The callback path must never lazily create its mutex: a native callback can
+// arrive immediately after the jump is written and the allocator/OnceLock
+// path is not a safe dependency at that ABI boundary.
 static ACTIVE_RUNTIME: OnceLock<Mutex<Option<ActiveRuntime>>> = OnceLock::new();
 static GRAPHICS_TARGETS: OnceLock<Mutex<GraphicsTargets>> = OnceLock::new();
 static ORIGINAL_END_SCENE: AtomicU32 = AtomicU32::new(0);
@@ -320,6 +324,10 @@ thread_local! {
 
 fn active_runtime() -> &'static Mutex<Option<ActiveRuntime>> {
     ACTIVE_RUNTIME.get_or_init(|| Mutex::new(None))
+}
+
+fn initialize_callback_runtime_slot() -> &'static Mutex<Option<ActiveRuntime>> {
+    active_runtime()
 }
 
 fn graphics_targets() -> &'static Mutex<GraphicsTargets> {
@@ -454,7 +462,8 @@ pub unsafe fn start<R>(runtime: R) -> Result<(), RuntimeStartError>
 where
     R: FrameRuntime + 'static,
 {
-    let mut slot = recover_lock(active_runtime().lock());
+    let runtime_slot = initialize_callback_runtime_slot();
+    let mut slot = recover_lock(runtime_slot.lock());
     if slot.is_some() {
         return Err(RuntimeStartError::AlreadyRunning);
     }
@@ -704,7 +713,10 @@ impl Drop for SwapReentryGuard {
 }
 
 fn dispatch_frame(frame: NativeFrame<'_>) {
-    let mut slot = match active_runtime().try_lock() {
+    let Some(runtime_slot) = ACTIVE_RUNTIME.get() else {
+        return;
+    };
+    let mut slot = match runtime_slot.try_lock() {
         Ok(slot) => slot,
         Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
         Err(TryLockError::WouldBlock) => return,
@@ -723,7 +735,10 @@ fn dispatch_reset(
     frame: NativeFrame<'_>,
     callback: impl FnOnce(&mut dyn FrameRuntime, NativeFrame<'_>),
 ) {
-    let mut slot = match active_runtime().try_lock() {
+    let Some(runtime_slot) = ACTIVE_RUNTIME.get() else {
+        return;
+    };
+    let mut slot = match runtime_slot.try_lock() {
         Ok(slot) => slot,
         Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
         Err(TryLockError::WouldBlock) => return,

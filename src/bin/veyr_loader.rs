@@ -1,6 +1,6 @@
 //! Windows x86 developer loader for the injected visual smoke test.
 //!
-//! Usage: `veyr_loader.exe <wow-pid> <absolute-or-relative-path-to-veyr.dll>`.
+//! Usage: `veyr.exe <wow-pid> <absolute-or-relative-path-to-veyr.dll>`.
 //! It loads the DLL, then calls its `CreateRemoteThread`-compatible bootstrap
 //! export with the visual-smoke command. `status` and `stop` address an
 //! already injected matching DLL without loading a second copy.
@@ -8,14 +8,14 @@
 #[cfg(all(windows, target_arch = "x86"))]
 fn main() {
     if let Err(error) = windows_x86::run() {
-        eprintln!("veyr-loader: {error}");
+        eprintln!("veyr: {error}");
         std::process::exit(1);
     }
 }
 
 #[cfg(not(all(windows, target_arch = "x86")))]
 fn main() {
-    eprintln!("veyr-loader is a Windows x86 developer tool; build it for i686-pc-windows-gnu.");
+    eprintln!("veyr is a Windows x86 developer tool; build it for i686-pc-windows-gnu.");
     std::process::exit(1);
 }
 
@@ -41,8 +41,9 @@ mod windows_x86 {
             memory::{object, object_manager, unit},
             RemoteAddress,
         },
-        RemoteCommand, RemoteGraphicsConfiguration, GRAPHICS_BACKEND_D3D9, GRAPHICS_BACKEND_OPENGL,
-        GRAPHICS_CONFIGURATION_ABI_VERSION,
+        RemoteCommand, RemoteGraphicsConfiguration, RemoteLaunchOutcome, RemoteLaunchReport,
+        RemoteLaunchRequest, GRAPHICS_BACKEND_D3D9, GRAPHICS_BACKEND_OPENGL,
+        GRAPHICS_CONFIGURATION_ABI_VERSION, REMOTE_LAUNCH_ABI_VERSION,
     };
 
     type Handle = *mut c_void;
@@ -61,13 +62,14 @@ mod windows_x86 {
     const TH32CS_SNAPMODULE: u32 = 0x0000_0008;
     const TH32CS_SNAPMODULE32: u32 = 0x0000_0010;
     const WAIT_OBJECT_0: u32 = 0;
+    const WAIT_TIMEOUT: u32 = 0x0000_0102;
     const INFINITE: u32 = u32::MAX;
     const CREATE_SUSPENDED: u32 = 0x0000_0004;
     const ERROR_BAD_LENGTH: u32 = 24;
     const ERROR_NO_MORE_FILES: u32 = 18;
     const ERROR_PARTIAL_COPY: u32 = 299;
     const CAPTURE_TIMEOUT: Duration = Duration::from_secs(30);
-    const CAPTURE_POLL_INTERVAL: Duration = Duration::from_millis(100);
+    const LAUNCH_WORKER_GRACE: Duration = Duration::from_secs(5);
     const LOADER_BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(10);
     const LOADER_BOOTSTRAP_POLL_INTERVAL: Duration = Duration::from_millis(5);
     // A process created with CREATE_SUSPENDED cannot have its DLL loaded via
@@ -385,7 +387,7 @@ mod windows_x86 {
                     required_diagnostic(&process, remote_command, RemoteCommand::FrameCount)?;
                 if frames == 0 {
                     return Err(
-                        "the graphics runtime has not dispatched a frame; launch the game through veyr-loader first"
+                        "the graphics runtime has not dispatched a frame; launch the game through veyr first"
                             .to_owned(),
                     );
                 }
@@ -488,9 +490,14 @@ mod windows_x86 {
         }
     }
 
-    /// Starts the game suspended, arms the DLL's D3D9 creation capture, then
-    /// resumes the primary thread and configures the renderer from the device
-    /// that the game actually created.
+    /// Starts the game, arms capture before D3D9 creation, then lets exactly
+    /// one injected worker configure and start the runtime after capture.
+    ///
+    /// The primary process is allowed to finish the user-mode loader bootstrap
+    /// first because Windows denies a remote thread before that point. D3D9 is
+    /// not allowed to initialize between injection and arming: this code keeps
+    /// the normal WoW start sequence at the beginning of the graphics path and
+    /// moves all post-capture work into the already-created worker.
     fn run_launch(arguments: LaunchArguments) -> Result<(), String> {
         let mut launched = SuspendedProcess::start(&arguments.executable_path)?;
         println!(
@@ -535,126 +542,93 @@ mod windows_x86 {
             ));
         }
 
-        println!("waiting for Direct3DCreate9/CreateDevice");
-        let captured = wait_for_d3d9_capture(&process, remote_command)?;
-        println!("captured IDirect3DDevice9: 0x{:08X}", captured.device);
-        println!(
-            "captured D3D9 EndScene:    0x{:08X}",
-            captured.targets.end_scene
-        );
-        println!(
-            "captured D3D9 Reset:       0x{:08X}",
-            captured.targets.reset
-        );
+        let worker_rva = local_module.export_rva(b"veyr_remote_launch_player_circle\0")?;
+        let worker_address = remote_module.checked_add(worker_rva).ok_or_else(|| {
+            "remote launch worker address overflowed x86 address space".to_owned()
+        })?;
+        let request = [RemoteLaunchRequest::player_circle(
+            CAPTURE_TIMEOUT.as_millis() as u32,
+        )];
+        let remote_request = RemoteAllocation::write_slice(&process, &request)?;
+        let worker = start_remote_thread(&process, worker_address, remote_request.address)
+            .map_err(|error| error.describe("D3D9 launch worker"))?;
 
-        let configuration = RemoteGraphicsConfiguration {
-            abi_version: GRAPHICS_CONFIGURATION_ABI_VERSION,
-            backend: GRAPHICS_BACKEND_D3D9,
-            frame_target: captured.targets.end_scene,
-            auxiliary_target: captured.targets.reset,
-            d3d9_device: captured.device,
-        };
-        let result = configure_and_start_runtime(
-            &process,
-            &local_module,
-            remote_module,
-            remote_command,
-            configuration,
-            RemoteCommand::StartPlayerCircle,
-        )?;
+        println!("D3D9 launch worker is ready; resuming WoW startup");
+        launched.resume()?;
+        let worker_result = wait_remote_result_for(
+            worker,
+            duration_to_wait_millis(CAPTURE_TIMEOUT + LAUNCH_WORKER_GRACE),
+        )
+        .map_err(|error| error.describe("D3D9 launch worker"))?;
+        let report = remote_request.read_value::<RemoteLaunchRequest>("D3D9 launch report")?;
+        print_launch_report(&report.report);
+        validate_launch_worker_result(worker_result, &report.report)?;
+
         println!("injected module loaded at 0x{remote_module:08X}");
-        println!("player circle result: {result}");
-        if result == 0 {
-            println!("success: enter the world and look for the wide cyan radius-20 circle around your player");
-            Ok(())
-        } else {
-            if let Some(code) =
-                query_optional_command(&process, remote_command, RemoteCommand::LastHookError)?
-            {
-                print_hook_error(code);
-            }
-            Err(format!(
-                "player circle startup failed with veyr status {result}"
-            ))
+        println!("player circle result: {}", report.report.runtime_result);
+        println!("success: enter the world and look for the wide cyan radius-20 circle around your player");
+        Ok(())
+    }
+
+    fn print_launch_report(report: &RemoteLaunchReport) {
+        println!(
+            "D3D9 capture: state {}, factory calls {}, CreateDevice calls {}",
+            report.capture_state, report.factory_calls, report.create_device_calls
+        );
+        if report.device != 0 {
+            println!("captured IDirect3DDevice9: 0x{:08X}", report.device);
+            println!("captured D3D9 EndScene:    0x{:08X}", report.end_scene);
+            println!("captured D3D9 Reset:       0x{:08X}", report.reset);
         }
     }
 
-    #[derive(Debug, Copy, Clone)]
-    struct CapturedD3d9 {
-        device: RemoteAddress,
-        targets: hooks::Direct3d9Targets,
-    }
-
-    fn wait_for_d3d9_capture(
-        process: &Process,
-        remote_command: u32,
-    ) -> Result<CapturedD3d9, String> {
-        let deadline = Instant::now() + CAPTURE_TIMEOUT;
-        loop {
-            let state = call_remote(
-                process,
-                remote_command,
-                RemoteCommand::D3d9CaptureState as u32,
-            )?;
-            match state {
-                3 => {
-                    let device = call_remote(
-                        process,
-                        remote_command,
-                        RemoteCommand::CapturedD3d9Device as u32,
-                    )?;
-                    let end_scene = call_remote(
-                        process,
-                        remote_command,
-                        RemoteCommand::CapturedD3d9EndScene as u32,
-                    )?;
-                    let reset = call_remote(
-                        process,
-                        remote_command,
-                        RemoteCommand::CapturedD3d9Reset as u32,
-                    )?;
-                    let targets = hooks::Direct3d9Targets { end_scene, reset };
-                    if device == 0 || !targets.is_valid() {
-                        return Err(
-                            "D3D9 capture reported success with an invalid device or method targets"
-                                .to_owned(),
-                        );
-                    }
-                    return Ok(CapturedD3d9 { device, targets });
-                }
-                4 => {
-                    let error = call_remote(
-                        process,
-                        remote_command,
-                        RemoteCommand::D3d9CaptureError as u32,
-                    )?;
-                    print_d3d9_capture_error(error);
-                    return Err("D3D9 creation capture failed inside veyr.dll".to_owned());
-                }
-                0..=2 => {
-                    if Instant::now() >= deadline {
-                        let factory_calls = call_remote(
-                            process,
-                            remote_command,
-                            RemoteCommand::D3d9FactoryCallCount as u32,
-                        )?;
-                        let create_device_calls = call_remote(
-                            process,
-                            remote_command,
-                            RemoteCommand::D3d9CreateDeviceCallCount as u32,
-                        )?;
-                        return Err(format!(
-                            "timed out waiting for D3D9 creation capture (state {state}, Direct3DCreate9 calls {factory_calls}, CreateDevice calls {create_device_calls}); this client may not be using D3D9"
-                        ));
-                    }
-                    sleep(CAPTURE_POLL_INTERVAL);
-                }
-                value => {
-                    return Err(format!(
-                        "veyr.dll returned an unknown D3D9 capture state {value}"
-                    ));
-                }
+    fn validate_launch_worker_result(
+        worker_result: u32,
+        report: &RemoteLaunchReport,
+    ) -> Result<(), String> {
+        if report.abi_version != REMOTE_LAUNCH_ABI_VERSION {
+            return Err(format!(
+                "veyr.dll returned incompatible launch-report ABI {}",
+                report.abi_version
+            ));
+        }
+        if worker_result != report.outcome {
+            return Err(format!(
+                "D3D9 launch worker returned {worker_result}, but its report says {}",
+                report.outcome
+            ));
+        }
+        match report.outcome {
+            value if value == RemoteLaunchOutcome::Started as u32 => Ok(()),
+            value if value == RemoteLaunchOutcome::CaptureFailed as u32 => {
+                print_d3d9_capture_error(report.capture_error);
+                Err("D3D9 creation capture failed inside veyr.dll".to_owned())
             }
+            value if value == RemoteLaunchOutcome::CaptureTimedOut as u32 => Err(format!(
+                "timed out waiting for D3D9 creation capture (state {}, Direct3DCreate9 calls {}, CreateDevice calls {})",
+                report.capture_state, report.factory_calls, report.create_device_calls
+            )),
+            value if value == RemoteLaunchOutcome::ConfigurationFailed as u32 => Err(format!(
+                "veyr.dll rejected the captured D3D9 configuration with status {}",
+                report.configuration_result
+            )),
+            value if value == RemoteLaunchOutcome::RuntimeStartFailed as u32 => {
+                print_hook_error(report.hook_error);
+                Err(format!(
+                    "player circle startup failed with veyr status {}",
+                    report.runtime_result
+                ))
+            }
+            value if value == RemoteLaunchOutcome::InvalidRequest as u32 => {
+                Err("veyr.dll rejected the private D3D9 launch request".to_owned())
+            }
+            value if value == RemoteLaunchOutcome::Panicked as u32 => {
+                Err("veyr.dll contained a panic in the D3D9 launch worker".to_owned())
+            }
+            value if value == RemoteLaunchOutcome::Pending as u32 => {
+                Err("D3D9 launch worker exited without a final report".to_owned())
+            }
+            value => Err(format!("veyr.dll reported unknown launch-worker outcome {value}")),
         }
     }
 
@@ -673,29 +647,6 @@ mod windows_x86 {
             }
             sleep(LOADER_BOOTSTRAP_POLL_INTERVAL);
         }
-    }
-
-    fn configure_and_start_runtime(
-        process: &Process,
-        local_module: &LocalModule,
-        remote_module: u32,
-        remote_command: u32,
-        configuration: RemoteGraphicsConfiguration,
-        command: RemoteCommand,
-    ) -> Result<u32, String> {
-        let configure_rva = local_module.export_rva(b"veyr_remote_configure_graphics\0")?;
-        let configure = remote_module.checked_add(configure_rva).ok_or_else(|| {
-            "remote graphics configuration address overflowed x86 address space".to_owned()
-        })?;
-        let remote_configuration = RemoteAllocation::write_slice(process, &[configuration])?;
-        let configure_result = call_remote(process, configure, remote_configuration.address)?;
-        println!("graphics configuration result: {configure_result}");
-        if configure_result != 0 {
-            return Err(format!(
-                "veyr.dll rejected the captured graphics configuration with status {configure_result}"
-            ));
-        }
-        call_remote(process, remote_command, command as u32)
     }
 
     fn print_d3d9_capture_error(code: u32) {
@@ -1843,7 +1794,7 @@ mod windows_x86 {
     }
 
     fn usage() -> String {
-        "usage: veyr_loader.exe launch <path-to-WoW.exe> <path-to-veyr.dll>\n       veyr_loader.exe <wow-pid> <path-to-veyr.dll>\n       veyr_loader.exe status <wow-pid> <path-to-currently-injected-veyr.dll>\n       veyr_loader.exe terrain <wow-pid> <path-to-currently-injected-veyr.dll>\n       veyr_loader.exe stop <wow-pid> <path-to-currently-injected-veyr.dll>".to_owned()
+        "usage: veyr.exe launch <path-to-WoW.exe> <path-to-veyr.dll>\n       veyr.exe <wow-pid> <path-to-veyr.dll>\n       veyr.exe status <wow-pid> <path-to-currently-injected-veyr.dll>\n       veyr.exe terrain <wow-pid> <path-to-currently-injected-veyr.dll>\n       veyr.exe stop <wow-pid> <path-to-currently-injected-veyr.dll>".to_owned()
     }
 
     fn inject(process: &Process, dll_path: &Path) -> Result<u32, String> {
@@ -1988,6 +1939,20 @@ mod windows_x86 {
         address: u32,
         parameter: u32,
     ) -> Result<u32, RemoteCallError> {
+        let thread = start_remote_thread(process, address, parameter)?;
+        wait_remote_result(thread)
+    }
+
+    /// Starts a private thread-entry export without waiting for it.
+    ///
+    /// This is used only for the pre-created launch worker. It lets that one
+    /// worker wait inside `veyr.dll` while the loader releases WoW startup,
+    /// rather than polling by creating a sequence of extra remote threads.
+    fn start_remote_thread(
+        process: &Process,
+        address: u32,
+        parameter: u32,
+    ) -> Result<HandleGuard, RemoteCallError> {
         let entry: ThreadEntry = unsafe { transmute(address as usize) };
         let thread = unsafe {
             CreateRemoteThread(
@@ -2005,7 +1970,7 @@ mod windows_x86 {
                 win32_error: unsafe { GetLastError() },
             });
         }
-        wait_remote_result(HandleGuard(thread))
+        Ok(HandleGuard(thread))
     }
 
     fn call_remote(process: &Process, address: u32, parameter: u32) -> Result<u32, String> {
@@ -2040,7 +2005,18 @@ mod windows_x86 {
     }
 
     fn wait_remote_result(thread: HandleGuard) -> Result<u32, RemoteCallError> {
-        if unsafe { WaitForSingleObject(thread.0, INFINITE) } != WAIT_OBJECT_0 {
+        wait_remote_result_for(thread, INFINITE)
+    }
+
+    fn wait_remote_result_for(
+        thread: HandleGuard,
+        milliseconds: u32,
+    ) -> Result<u32, RemoteCallError> {
+        let wait_result = unsafe { WaitForSingleObject(thread.0, milliseconds) };
+        if wait_result == WAIT_TIMEOUT {
+            return Err(RemoteCallError::Timeout { milliseconds });
+        }
+        if wait_result != WAIT_OBJECT_0 {
             return Err(RemoteCallError::Wait {
                 win32_error: unsafe { GetLastError() },
             });
@@ -2060,6 +2036,7 @@ mod windows_x86 {
         CreateThread { win32_error: u32 },
         Wait { win32_error: u32 },
         ExitCode { win32_error: u32 },
+        Timeout { milliseconds: u32 },
     }
 
     impl RemoteCallError {
@@ -2076,8 +2053,15 @@ mod windows_x86 {
                 Self::ExitCode { win32_error } => {
                     format!("{operation}: GetExitCodeThread failed with Win32 error {win32_error}")
                 }
+                Self::Timeout { milliseconds } => {
+                    format!("{operation}: did not finish within {milliseconds} ms")
+                }
             }
         }
+    }
+
+    fn duration_to_wait_millis(duration: Duration) -> u32 {
+        u32::try_from(duration.as_millis()).unwrap_or(u32::MAX - 1)
     }
 
     fn wide_null(value: &OsStr) -> Vec<u16> {
@@ -2212,7 +2196,7 @@ mod windows_x86 {
             }
             if loader_is_wow64 != 0 && target_is_wow64 == 0 {
                 return Err(
-                    "the selected WoW executable is 64-bit, but veyr.dll and veyr_loader.exe are x86; choose the 32-bit client executable"
+                    "the selected WoW executable is 64-bit, but veyr.dll and veyr.exe are x86; choose the 32-bit client executable"
                         .to_owned(),
                 );
             }
@@ -2299,6 +2283,20 @@ mod windows_x86 {
                 return Err(last_error("WriteProcessMemory"));
             }
             Ok(allocation)
+        }
+
+        fn read_value<T: Copy>(&self, context: &str) -> Result<T, String> {
+            let mut value = core::mem::MaybeUninit::<T>::uninit();
+            let bytes = unsafe {
+                core::slice::from_raw_parts_mut(
+                    value.as_mut_ptr().cast::<u8>(),
+                    core::mem::size_of::<T>(),
+                )
+            };
+            read_remote_into(self.process, self.address, bytes, context)?;
+            // `read_remote_into` filled the exact object representation and
+            // callers use only plain `repr(C)` word structures.
+            Ok(unsafe { value.assume_init() })
         }
     }
 

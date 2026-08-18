@@ -7,7 +7,7 @@ PROJECT_ROOT="${SCRIPT_DIR:h}"
 DIST_DIR="${1:-$PROJECT_ROOT/dist}"
 MANIFEST="$DIST_DIR/manifest.json"
 DLL="$DIST_DIR/veyr.dll"
-LOADER="$DIST_DIR/veyr_loader.exe"
+LOADER="$DIST_DIR/veyr.exe"
 
 require_windows_x86() {
     local artifact="$1"
@@ -33,11 +33,11 @@ manifest_value() {
         veyr.dll:bytes)
             pattern='/"veyr\.dll"/s/.*"bytes": ([0-9]+).*/\1/p'
             ;;
-        veyr_loader.exe:sha256)
-            pattern='/"veyr_loader\.exe"/s/.*"sha256": "([0-9a-f]{64})".*/\1/p'
+        veyr.exe:sha256)
+            pattern='/"veyr\.exe"/s/.*"sha256": "([0-9a-f]{64})".*/\1/p'
             ;;
-        veyr_loader.exe:bytes)
-            pattern='/"veyr_loader\.exe"/s/.*"bytes": ([0-9]+).*/\1/p'
+        veyr.exe:bytes)
+            pattern='/"veyr\.exe"/s/.*"bytes": ([0-9]+).*/\1/p'
             ;;
         *)
             print -u2 -- "Unsupported manifest lookup: $artifact $field"
@@ -84,5 +84,5 @@ verify_artifact() {
 }
 
 verify_artifact "$DLL" "veyr.dll"
-verify_artifact "$LOADER" "veyr_loader.exe"
+verify_artifact "$LOADER" "veyr.exe"
 print -- "Verified Windows x86 artifacts in $DIST_DIR"

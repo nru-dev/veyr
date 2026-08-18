@@ -10,7 +10,9 @@ use crate::offsets::{
 ///
 /// `ReadProcessMemory`/`WriteProcessMemory` are used even in-process so an
 /// invalid client address becomes a normal API error instead of an unchecked
-/// Rust pointer dereference.
+/// Rust pointer dereference. Calls made from a graphics callback can therefore
+/// request `LocalProcessMemory` without treating a callback-owned COM pointer
+/// as a Rust reference.
 #[derive(Debug, Copy, Clone, Default)]
 pub struct LocalProcessMemory;
 
@@ -28,7 +30,7 @@ pub enum LocalProcessMemoryError {
 }
 
 impl LocalProcessMemory {
-    fn read<T: Copy>(&self, address: RemoteAddress) -> Result<T, LocalProcessMemoryError> {
+    fn read<T: Copy>(address: RemoteAddress) -> Result<T, LocalProcessMemoryError> {
         let mut value = MaybeUninit::<T>::uninit();
         let mut bytes_read = 0_usize;
         let expected = size_of::<T>();
@@ -52,11 +54,7 @@ impl LocalProcessMemory {
         Ok(unsafe { value.assume_init() })
     }
 
-    fn write<T: Copy>(
-        &self,
-        address: RemoteAddress,
-        value: T,
-    ) -> Result<(), LocalProcessMemoryError> {
+    fn write<T: Copy>(address: RemoteAddress, value: T) -> Result<(), LocalProcessMemoryError> {
         let mut bytes_written = 0_usize;
         let expected = size_of::<T>();
         let succeeded = unsafe {
@@ -84,37 +82,37 @@ impl Memory for LocalProcessMemory {
     type Error = LocalProcessMemoryError;
 
     fn read_u8(&self, address: RemoteAddress) -> Result<u8, Self::Error> {
-        self.read(address)
+        Self::read(address)
     }
 
     fn read_u32(&self, address: RemoteAddress) -> Result<u32, Self::Error> {
-        self.read(address)
+        Self::read(address)
     }
 
     fn read_u64(&self, address: RemoteAddress) -> Result<u64, Self::Error> {
-        self.read(address)
+        Self::read(address)
     }
 
     fn read_f32(&self, address: RemoteAddress) -> Result<f32, Self::Error> {
-        self.read(address)
+        Self::read(address)
     }
 }
 
 impl WritableMemory for LocalProcessMemory {
     fn write_u8(&self, address: RemoteAddress, value: u8) -> Result<(), Self::Error> {
-        self.write(address, value)
+        Self::write(address, value)
     }
 
     fn write_u32(&self, address: RemoteAddress, value: u32) -> Result<(), Self::Error> {
-        self.write(address, value)
+        Self::write(address, value)
     }
 
     fn write_u64(&self, address: RemoteAddress, value: u64) -> Result<(), Self::Error> {
-        self.write(address, value)
+        Self::write(address, value)
     }
 
     fn write_f32(&self, address: RemoteAddress, value: f32) -> Result<(), Self::Error> {
-        self.write(address, value)
+        Self::write(address, value)
     }
 }
 

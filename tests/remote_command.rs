@@ -1,6 +1,7 @@
 use veyr::{
-    RemoteCommand, RemoteGraphicsConfiguration, GRAPHICS_BACKEND_D3D9, GRAPHICS_BACKEND_OPENGL,
-    GRAPHICS_CONFIGURATION_ABI_VERSION,
+    RemoteCommand, RemoteGraphicsConfiguration, RemoteLaunchOutcome, RemoteLaunchReport,
+    RemoteLaunchRequest, GRAPHICS_BACKEND_D3D9, GRAPHICS_BACKEND_OPENGL,
+    GRAPHICS_CONFIGURATION_ABI_VERSION, REMOTE_LAUNCH_ABI_VERSION,
 };
 
 #[test]
@@ -46,4 +47,19 @@ fn graphics_configuration_abi_is_plain_x86_words() {
     assert_eq!(GRAPHICS_BACKEND_OPENGL, 2);
     assert_eq!(core::mem::size_of::<RemoteGraphicsConfiguration>(), 20);
     assert_eq!(core::mem::align_of::<RemoteGraphicsConfiguration>(), 4);
+}
+
+#[test]
+fn launch_worker_abi_is_plain_words_and_starts_pending() {
+    let request = RemoteLaunchRequest::player_circle(30_000);
+
+    assert_eq!(REMOTE_LAUNCH_ABI_VERSION, 1);
+    assert_eq!(request.abi_version, REMOTE_LAUNCH_ABI_VERSION);
+    assert_eq!(request.capture_timeout_millis, 30_000);
+    assert_eq!(request.report.abi_version, REMOTE_LAUNCH_ABI_VERSION);
+    assert_eq!(request.report.outcome, RemoteLaunchOutcome::Pending as u32);
+    assert_eq!(core::mem::size_of::<RemoteLaunchReport>(), 48);
+    assert_eq!(core::mem::align_of::<RemoteLaunchReport>(), 4);
+    assert_eq!(core::mem::size_of::<RemoteLaunchRequest>(), 56);
+    assert_eq!(core::mem::align_of::<RemoteLaunchRequest>(), 4);
 }
