@@ -55,9 +55,11 @@ pub struct D3d9CaptureSnapshot {
 }
 
 type Direct3dCreate9Fn = unsafe extern "system" fn(sdk_version: u32) -> *mut c_void;
-/// `IDirect3D9::CreateDevice` is a COM method. The exact x86 `thiscall`
-/// ABI keeps `this` in ECX and the remaining six arguments on the stack.
-type CreateDeviceFn = unsafe extern "thiscall" fn(
+/// `IDirect3D9::CreateDevice` is a COM `STDMETHODCALLTYPE` method. On the
+/// supported x86 target this is `__stdcall`: `this` is the first stack
+/// argument and the callee pops all seven words. It is not a C++
+/// `__thiscall` member-function call.
+type CreateDeviceFn = unsafe extern "system" fn(
     factory: *mut c_void,
     adapter: u32,
     device_type: u32,
