@@ -4,6 +4,7 @@
 !/dist/veyr.dll
 /dist/*.exe
 !/dist/veyr_loader.exe
+!/dist/manifest.json
 /dist/stable/*
 !/dist/stable/veyr.dll
 !/dist/stable/veyr_loader.exe
