@@ -64,27 +64,24 @@ mod windows_x86 {
     const WAIT_OBJECT_0: u32 = 0;
     const WAIT_TIMEOUT: u32 = 0x0000_0102;
     const INFINITE: u32 = u32::MAX;
-    const CREATE_SUSPENDED: u32 = 0x0000_0004;
+    const DEBUG_ONLY_THIS_PROCESS: u32 = 0x0000_0002;
     const ERROR_BAD_LENGTH: u32 = 24;
     const ERROR_NO_MORE_FILES: u32 = 18;
     const ERROR_PARTIAL_COPY: u32 = 299;
     const CAPTURE_TIMEOUT: Duration = Duration::from_secs(30);
     const LAUNCH_WORKER_GRACE: Duration = Duration::from_secs(5);
-    const LOADER_BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(10);
-    const LOADER_BOOTSTRAP_POLL_INTERVAL: Duration = Duration::from_millis(5);
-    // A process created with CREATE_SUSPENDED cannot have its DLL loaded via
-    // CreateRemoteThread until the user-mode loader has initialized.  There
-    // is a narrow hand-off interval after kernel32 becomes visible where a
-    // remote thread still returns ERROR_ACCESS_DENIED.  A short bounded retry
-    // covers that transition without making ordinary control requests hang.
-    const REMOTE_THREAD_BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(5);
-    const REMOTE_THREAD_BOOTSTRAP_POLL_INTERVAL: Duration = Duration::from_millis(5);
-    const ERROR_ACCESS_DENIED: u32 = 5;
-    // The ToolHelp module walk races the target's user-mode loader.  Microsoft
-    // explicitly documents ERROR_BAD_LENGTH for this case and asks callers to
-    // retry the snapshot.  Keep that recovery local to every module lookup,
-    // rather than assuming that seeing kernel32 once means the module list is
-    // already stable for the following LoadLibrary injection.
+    const STARTUP_GATE_TIMEOUT: Duration = Duration::from_secs(10);
+    // The debugger's initial breakpoint is the earliest user-mode point at
+    // which the process loader has mapped kernel32 and accepts a remote
+    // LoadLibrary thread. It lets us inject and arm before `Wow.exe` executes
+    // any application startup code or initializes D3D9.
+    const EXCEPTION_BREAKPOINT: u32 = 0x8000_0003;
+    const DBG_CONTINUE: u32 = 0x0001_0002;
+    const DBG_EXCEPTION_NOT_HANDLED: u32 = 0x8001_0001;
+    const EXIT_PROCESS_DEBUG_EVENT: u32 = 5;
+    // The ToolHelp module walk can still race a freshly initialized loader.
+    // Microsoft documents ERROR_BAD_LENGTH for this case and asks callers to
+    // retry the snapshot. Keep that recovery local to every module lookup.
     const MODULE_SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(5);
     const MODULE_SNAPSHOT_POLL_INTERVAL: Duration = Duration::from_millis(5);
     const MODULE_SNAPSHOT_MAX_ATTEMPTS: u32 = 1_000;
@@ -152,6 +149,49 @@ mod windows_x86 {
         thread_id: u32,
     }
 
+    #[repr(C)]
+    #[derive(Copy, Clone)]
+    struct ExceptionRecord {
+        code: u32,
+        flags: u32,
+        nested_record: *mut ExceptionRecord,
+        address: *mut c_void,
+        parameter_count: u32,
+        information: [u32; 15],
+    }
+
+    #[repr(C)]
+    #[derive(Copy, Clone)]
+    struct ExceptionDebugInfo {
+        record: ExceptionRecord,
+        first_chance: u32,
+    }
+
+    #[repr(C)]
+    union DebugEventData {
+        exception: ExceptionDebugInfo,
+        raw: [u8; 164],
+    }
+
+    #[repr(C)]
+    struct DebugEvent {
+        event_code: u32,
+        process_id: u32,
+        thread_id: u32,
+        data: DebugEventData,
+    }
+
+    impl DebugEvent {
+        fn initial_breakpoint(&self) -> bool {
+            if self.event_code != 1 {
+                return false;
+            }
+            // Safety: the active union member is `exception` exactly when
+            // `event_code == EXCEPTION_DEBUG_EVENT` (value 1).
+            unsafe { self.data.exception.record.code == EXCEPTION_BREAKPOINT }
+        }
+    }
+
     extern "system" {
         fn CloseHandle(handle: Handle) -> i32;
         fn CreateToolhelp32Snapshot(flags: u32, process_id: u32) -> Handle;
@@ -176,6 +216,8 @@ mod windows_x86 {
             startup_info: *mut StartupInfoW,
             process_information: *mut ProcessInformation,
         ) -> i32;
+        fn ContinueDebugEvent(process_id: u32, thread_id: u32, continue_status: u32) -> i32;
+        fn DebugActiveProcessStop(process_id: u32) -> i32;
         fn FreeLibrary(module: Module) -> i32;
         fn GetExitCodeThread(thread: Handle, exit_code: *mut u32) -> i32;
         fn GetCurrentProcess() -> Handle;
@@ -195,6 +237,7 @@ mod windows_x86 {
             bytes_read: *mut usize,
         ) -> i32;
         fn ResumeThread(thread: Handle) -> u32;
+        fn SuspendThread(thread: Handle) -> u32;
         fn VirtualAllocEx(
             process: Handle,
             address: *const c_void,
@@ -205,6 +248,7 @@ mod windows_x86 {
         fn VirtualFreeEx(process: Handle, address: *mut c_void, size: usize, free_type: u32)
             -> i32;
         fn WaitForSingleObject(handle: Handle, milliseconds: u32) -> u32;
+        fn WaitForDebugEvent(event: *mut DebugEvent, milliseconds: u32) -> i32;
         fn WriteProcessMemory(
             process: Handle,
             base_address: *mut c_void,
@@ -490,18 +534,19 @@ mod windows_x86 {
         }
     }
 
-    /// Starts the game, arms capture before D3D9 creation, then lets exactly
-    /// one injected worker configure and start the runtime after capture.
+    /// Starts WoW under a short-lived debugger gate, arms D3D9 capture at the
+    /// initial user-mode breakpoint, then lets exactly one injected worker
+    /// configure and start the runtime after capture.
     ///
-    /// The primary process is allowed to finish the user-mode loader bootstrap
-    /// first because Windows denies a remote thread before that point. D3D9 is
-    /// not allowed to initialize between injection and arming: this code keeps
-    /// the normal WoW start sequence at the beginning of the graphics path and
-    /// moves all post-capture work into the already-created worker.
+    /// `CREATE_SUSPENDED` alone is not a usable early-injection gate: after
+    /// its first `ResumeThread` the primary thread is no longer suspended, so
+    /// a later "resume" is a no-op. The debugger's initial breakpoint occurs
+    /// after kernel32 is ready for `LoadLibraryW` but before `Wow.exe` has run
+    /// application code, closing the race with `Direct3DCreate9` entirely.
     fn run_launch(arguments: LaunchArguments) -> Result<(), String> {
-        let mut launched = SuspendedProcess::start(&arguments.executable_path)?;
+        let mut launched = StartupGate::start(&arguments.executable_path)?;
         println!(
-            "started suspended game process: PID {} ({})",
+            "started startup-gated game process: PID {} ({})",
             launched.process_id,
             arguments.executable_path.display()
         );
@@ -509,21 +554,30 @@ mod windows_x86 {
         let process = Process::open(launched.process_id)?;
         process.ensure_x86_target()?;
         let local_module = LocalModule::load(&arguments.dll_path)?;
-        // `CREATE_SUSPENDED` stops the primary thread before the user-mode
-        // loader has mapped kernel32. A remote LoadLibrary call is impossible
-        // at that instant. Let the bootstrap finish, then inject immediately
-        // while normal WoW startup is still far ahead of device creation.
-        //
-        // Do *not* wait for `d3d9.dll` here. On this client its presence is
-        // not evidence that WoW has made (or is about to make) the gameplay
-        // D3D9 device: a startup helper may load it first and hold it idle.
-        // Waiting for that module was a regression: it could let the real
-        // Direct3DCreate9/CreateDevice pair run before our capture hook was
-        // armed, leaving the capture permanently idle.
-        launched.resume()?;
-        wait_for_loader_bootstrap(&process)?;
-        println!("Windows loader bootstrap is ready; starting D3D9 launch worker");
+        // First leave the debugger while preserving the primary thread's
+        // explicit suspend count. Remote `LoadLibraryW` threads created below
+        // must not themselves generate debug events that would otherwise
+        // remain paused behind the initial breakpoint.
+        launched.prepare_injection()?;
+        println!("Windows initial loader breakpoint is ready; injecting veyr.dll");
         let remote_module = inject(&process, &arguments.dll_path)?;
+
+        let remote_command_rva = local_module.export_rva(b"veyr_remote_command\0")?;
+        let remote_command = remote_module
+            .checked_add(remote_command_rva)
+            .ok_or_else(|| "remote command address overflowed x86 address space".to_owned())?;
+        let arm_result = call_remote(
+            &process,
+            remote_command,
+            RemoteCommand::ArmD3d9Capture as u32,
+        )?;
+        println!("D3D9 creation capture arm result: {arm_result}");
+        if arm_result != 0 {
+            print_d3d9_capture_error(arm_result);
+            return Err(format!(
+                "veyr.dll could not arm D3D9 creation capture (status {arm_result})"
+            ));
+        }
 
         let worker_rva = local_module.export_rva(b"veyr_remote_launch_player_circle\0")?;
         let worker_address = remote_module.checked_add(worker_rva).ok_or_else(|| {
@@ -536,8 +590,8 @@ mod windows_x86 {
         let worker = start_remote_thread(&process, worker_address, remote_request.address)
             .map_err(|error| error.describe("D3D9 launch worker"))?;
 
-        println!("D3D9 launch worker is ready; resuming WoW startup");
-        launched.resume()?;
+        println!("D3D9 launch worker is ready; releasing WoW startup gate");
+        launched.release()?;
         let worker_result = wait_remote_result_for(
             worker,
             duration_to_wait_millis(CAPTURE_TIMEOUT + LAUNCH_WORKER_GRACE),
@@ -616,23 +670,6 @@ mod windows_x86 {
                 Err("D3D9 launch worker exited without a final report".to_owned())
             }
             value => Err(format!("veyr.dll reported unknown launch-worker outcome {value}")),
-        }
-    }
-
-    fn wait_for_loader_bootstrap(process: &Process) -> Result<(), String> {
-        let deadline = Instant::now() + LOADER_BOOTSTRAP_TIMEOUT;
-        loop {
-            match remote_module_optional(process, "kernel32.dll") {
-                Ok(Some(_)) => return Ok(()),
-                Ok(None) => {}
-                Err(error) => return Err(error),
-            }
-            if Instant::now() >= deadline {
-                return Err(
-                    "timed out waiting for the new process to initialize kernel32.dll".to_owned(),
-                );
-            }
-            sleep(LOADER_BOOTSTRAP_POLL_INTERVAL);
         }
     }
 
@@ -1789,12 +1826,8 @@ mod windows_x86 {
         let remote_path = RemoteAllocation::write_slice(process, &wide_path)?;
         let remote_load_library = remote_load_library_w(process)?;
 
-        let remote_base = call_remote_after_bootstrap(
-            process,
-            remote_load_library,
-            remote_path.address,
-            "LoadLibraryW(veyr.dll)",
-        )?;
+        let remote_base = call_remote(process, remote_load_library, remote_path.address)
+            .map_err(|error| format!("LoadLibraryW(veyr.dll): {error}"))?;
         if remote_base == 0 {
             return Err("the target rejected LoadLibraryW for veyr.dll".to_owned());
         }
@@ -1965,32 +1998,6 @@ mod windows_x86 {
             .map_err(|error| error.describe("remote command"))
     }
 
-    /// Calls the startup-only `LoadLibraryW` entry while the new target moves
-    /// from its user-mode-loader bootstrap into ordinary process execution.
-    ///
-    /// A failed `CreateRemoteThread` does not invoke `LoadLibraryW`, so retrying
-    /// that *specific* `ERROR_ACCESS_DENIED` is safe.  Wait and exit-code
-    /// failures are never retried because the remote call may have run.
-    fn call_remote_after_bootstrap(
-        process: &Process,
-        address: u32,
-        parameter: u32,
-        operation: &str,
-    ) -> Result<u32, String> {
-        let deadline = Instant::now() + REMOTE_THREAD_BOOTSTRAP_TIMEOUT;
-        loop {
-            match call_remote_raw(process, address, parameter) {
-                Ok(result) => return Ok(result),
-                Err(RemoteCallError::CreateThread { win32_error })
-                    if win32_error == ERROR_ACCESS_DENIED && Instant::now() < deadline =>
-                {
-                    sleep(REMOTE_THREAD_BOOTSTRAP_POLL_INTERVAL);
-                }
-                Err(error) => return Err(error.describe(operation)),
-            }
-        }
-    }
-
     fn wait_remote_result(thread: HandleGuard) -> Result<u32, RemoteCallError> {
         wait_remote_result_for(thread, INFINITE)
     }
@@ -2069,16 +2076,23 @@ mod windows_x86 {
         })
     }
 
-    /// Owns the primary thread while a new game process is still suspended.
-    /// Dropping this object always resumes it, so a loader-side error can never
-    /// leave the user's game frozen in the launcher.
-    struct SuspendedProcess {
+    /// Owns a newly created WoW process held at the debugger's initial
+    /// breakpoint. This is the first safe user-mode point for injection: the
+    /// target loader is initialized, but the WoW entry point has not run.
+    ///
+    /// Dropping the gate always continues its pending event and detaches the
+    /// debugger. Thus any loader-side error still lets the user start WoW
+    /// normally instead of leaving an invisible suspended process behind.
+    struct StartupGate {
         process_id: u32,
         primary_thread: Handle,
-        resumed: bool,
+        pending_event: Option<(u32, u32)>,
+        primary_thread_suspended: bool,
+        debugger_attached: bool,
+        released: bool,
     }
 
-    impl SuspendedProcess {
+    impl StartupGate {
         fn start(executable_path: &Path) -> Result<Self, String> {
             let application_name = wide_null(executable_path.as_os_str());
             let working_directory = executable_path
@@ -2095,7 +2109,7 @@ mod windows_x86 {
                     null(),
                     null(),
                     0,
-                    CREATE_SUSPENDED,
+                    DEBUG_ONLY_THIS_PROCESS,
                     null(),
                     current_directory.as_ptr(),
                     &mut startup_info,
@@ -2121,28 +2135,125 @@ mod windows_x86 {
             unsafe {
                 let _ = CloseHandle(process_information.process);
             }
-            Ok(Self {
+            let mut gate = Self {
                 process_id: process_information.process_id,
                 primary_thread: process_information.thread,
-                resumed: false,
-            })
+                pending_event: None,
+                primary_thread_suspended: false,
+                debugger_attached: true,
+                released: false,
+            };
+            if let Err(error) = gate.wait_for_initial_breakpoint() {
+                drop(gate);
+                return Err(error);
+            }
+            Ok(gate)
         }
 
-        fn resume(&mut self) -> Result<(), String> {
-            if self.resumed {
+        fn wait_for_initial_breakpoint(&mut self) -> Result<(), String> {
+            let deadline = Instant::now() + STARTUP_GATE_TIMEOUT;
+            loop {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err(
+                        "timed out waiting for WoW's initial Windows loader breakpoint".to_owned(),
+                    );
+                }
+                let mut event: DebugEvent = unsafe { zeroed() };
+                if unsafe { WaitForDebugEvent(&mut event, duration_to_wait_millis(remaining)) } == 0
+                {
+                    return Err(last_error("WaitForDebugEvent"));
+                }
+                if event.process_id != self.process_id {
+                    let _ = unsafe {
+                        ContinueDebugEvent(
+                            event.process_id,
+                            event.thread_id,
+                            DBG_EXCEPTION_NOT_HANDLED,
+                        )
+                    };
+                    continue;
+                }
+                if event.event_code == EXIT_PROCESS_DEBUG_EVENT {
+                    let _ = unsafe {
+                        ContinueDebugEvent(event.process_id, event.thread_id, DBG_CONTINUE)
+                    };
+                    return Err(
+                        "WoW exited before reaching its initial loader breakpoint".to_owned()
+                    );
+                }
+                if event.initial_breakpoint() {
+                    // Keep the original primary thread stopped after we
+                    // continue this debug event. Windows otherwise resumes
+                    // it as part of ContinueDebugEvent, and calling
+                    // DebugActiveProcessStop immediately afterward lets WoW
+                    // race D3D9 creation before the hook is armed.
+                    if unsafe { SuspendThread(self.primary_thread) } == u32::MAX {
+                        return Err(last_error("SuspendThread(primary thread)"));
+                    }
+                    self.primary_thread_suspended = true;
+                    self.pending_event = Some((event.process_id, event.thread_id));
+                    return Ok(());
+                }
+                if unsafe {
+                    ContinueDebugEvent(event.process_id, event.thread_id, DBG_EXCEPTION_NOT_HANDLED)
+                } == 0
+                {
+                    return Err(last_error("ContinueDebugEvent"));
+                }
+            }
+        }
+
+        /// Continues the initial debugger event and detaches while preserving
+        /// the primary thread's suspend count. After this returns it is safe
+        /// to create ordinary remote threads: no debug events remain pending,
+        /// but WoW itself still cannot advance into its entry point.
+        fn prepare_injection(&mut self) -> Result<(), String> {
+            let (process_id, thread_id) = self
+                .pending_event
+                .take()
+                .ok_or_else(|| "WoW startup gate has no pending debug event".to_owned())?;
+            if unsafe { ContinueDebugEvent(process_id, thread_id, DBG_CONTINUE) } == 0 {
+                return Err(last_error("ContinueDebugEvent(initial loader breakpoint)"));
+            }
+            if unsafe { DebugActiveProcessStop(self.process_id) } == 0 {
+                return Err(last_error("DebugActiveProcessStop"));
+            }
+            self.debugger_attached = false;
+            Ok(())
+        }
+
+        fn release(&mut self) -> Result<(), String> {
+            if self.released {
                 return Ok(());
             }
-            if unsafe { ResumeThread(self.primary_thread) } == u32::MAX {
-                return Err(last_error("ResumeThread"));
+            if self.debugger_attached {
+                return Err("WoW startup debugger has not been detached".to_owned());
             }
-            self.resumed = true;
+            if self.primary_thread_suspended
+                && unsafe { ResumeThread(self.primary_thread) } == u32::MAX
+            {
+                return Err(last_error("ResumeThread(primary thread)"));
+            }
+            self.primary_thread_suspended = false;
+            self.released = true;
             Ok(())
         }
     }
 
-    impl Drop for SuspendedProcess {
+    impl Drop for StartupGate {
         fn drop(&mut self) {
-            if !self.resumed {
+            if let Some((process_id, thread_id)) = self.pending_event.take() {
+                unsafe {
+                    let _ = ContinueDebugEvent(process_id, thread_id, DBG_CONTINUE);
+                }
+            }
+            if self.debugger_attached {
+                unsafe {
+                    let _ = DebugActiveProcessStop(self.process_id);
+                }
+            }
+            if self.primary_thread_suspended {
                 unsafe {
                     let _ = ResumeThread(self.primary_thread);
                 }

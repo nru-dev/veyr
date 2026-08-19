@@ -348,10 +348,11 @@ pub extern "system" fn veyr_d3d9_capture_error() -> u32 {
 /// Waits inside the injected process for the early D3D9 capture, then starts
 /// the player-circle runtime from its captured live device targets.
 ///
-/// The loader creates this one worker *before* it releases WoW's startup
-/// gate. It therefore never has to create a fresh remote thread for every
-/// diagnostic poll while the client is entering graphics initialization.
-/// The request allocation must stay valid until this function returns.
+/// The loader arms D3D9 capture synchronously while WoW is held at its
+/// startup gate, then creates this one worker before it releases the game.
+/// The worker therefore never creates fresh remote threads for diagnostics
+/// while the client is entering graphics initialization. The request
+/// allocation must stay valid until this function returns.
 #[cfg(all(windows, target_arch = "x86"))]
 #[no_mangle]
 pub unsafe extern "system" fn veyr_remote_launch_player_circle(
@@ -402,18 +403,10 @@ unsafe fn launch_player_circle_worker(
     // The loader owns the outer deadline too. Clamp the in-process wait so a
     // malformed request can never leave a remote worker alive indefinitely.
     let timeout = Duration::from_millis(u64::from(capture_timeout_millis.clamp(1, 120_000)));
-    // This worker is deliberately both the armer and the waiter. On the
-    // affected Windows client, the old launch flow consumed an additional
-    // `CreateRemoteThread` for every status query after arming; the third one
-    // could be rejected with ERROR_ACCESS_DENIED even though LoadLibrary and
-    // the arm command had succeeded. A single second remote thread now owns
-    // the complete in-process bootstrap and reports one final snapshot.
-    if let Err(error) = unsafe { injected::windows::arm_d3d9_capture() } {
-        let snapshot = injected::windows::d3d9_capture_snapshot();
-        let mut report = launch_report(snapshot, RemoteLaunchOutcome::CaptureFailed);
-        report.capture_error = error.diagnostic_code();
-        return (RemoteLaunchOutcome::CaptureFailed, report);
-    }
+    // Capture was armed by the loader before this worker was created. Doing
+    // that synchronously is essential: a newly created worker otherwise
+    // races WoW's first `Direct3DCreate9` call, and treating an already-armed
+    // capture as a worker failure hid that ordering bug.
     let deadline = Instant::now() + timeout;
     let snapshot = loop {
         let snapshot = injected::windows::d3d9_capture_snapshot();
