@@ -5,6 +5,7 @@ mod client_assets;
 mod d3d9_capture;
 mod d3d9_hook;
 mod d3d9_renderer;
+mod direct_hook;
 mod memory;
 mod opengl_hook;
 mod opengl_renderer;

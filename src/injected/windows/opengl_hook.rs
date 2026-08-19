@@ -5,7 +5,7 @@ use std::sync::atomic::AtomicU32;
 
 use crate::offsets::RemoteAddress;
 
-use super::d3d9_hook::{DirectHook, EndSceneHookError};
+use super::{d3d9_hook::EndSceneHookError, direct_hook::DirectHook};
 
 /// ABI shared by `wglSwapBuffers` and `gdi32!SwapBuffers` on Windows x86.
 pub type SwapBuffersFn = unsafe extern "system" fn(device_context: *mut c_void) -> i32;

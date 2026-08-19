@@ -14,7 +14,7 @@ use std::sync::{Mutex, OnceLock};
 
 use crate::offsets::{advanced_combat::hooks::Direct3d9Targets, RemoteAddress};
 
-use super::d3d9_hook::{DirectHook, EndSceneHookError};
+use super::{d3d9_hook::EndSceneHookError, direct_hook::DirectHook};
 
 /// Status returned through the private loader ABI while the early capture is
 /// armed. Values are explicit so the loader can print them without sharing

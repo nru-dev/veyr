@@ -474,10 +474,10 @@ where
     CALLBACK_PANIC_COUNT.store(0, Ordering::Release);
     reset_renderer_stats();
     let hooks = match targets {
-        GraphicsTargets::D3d9 { targets, .. } => {
+        GraphicsTargets::D3d9 { targets: _, device } => {
+            let device = device as usize as *mut c_void;
             let mut reset =
-                match unsafe { ResetHook::install(targets.reset, reset_dispatch, &ORIGINAL_RESET) }
-                {
+                match unsafe { ResetHook::install(device, reset_dispatch, &ORIGINAL_RESET) } {
                     Ok(hook) => hook,
                     Err(error) => {
                         ORIGINAL_RESET.store(0, Ordering::Release);
@@ -486,7 +486,7 @@ where
                 };
 
             let end_scene = match unsafe {
-                EndSceneHook::install(targets.end_scene, end_scene_dispatch, &ORIGINAL_END_SCENE)
+                EndSceneHook::install(device, end_scene_dispatch, &ORIGINAL_END_SCENE)
             } {
                 Ok(hook) => hook,
                 Err(error) => {
