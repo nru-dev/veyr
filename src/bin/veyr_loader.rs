@@ -65,20 +65,34 @@ mod windows_x86 {
     const WAIT_TIMEOUT: u32 = 0x0000_0102;
     const INFINITE: u32 = u32::MAX;
     const DEBUG_ONLY_THIS_PROCESS: u32 = 0x0000_0002;
+    const CONTEXT_CONTROL: u32 = 0x0001_0001;
+    const PAGE_EXECUTE_READWRITE: u32 = 0x40;
     const ERROR_BAD_LENGTH: u32 = 24;
     const ERROR_NO_MORE_FILES: u32 = 18;
     const ERROR_PARTIAL_COPY: u32 = 299;
     const CAPTURE_TIMEOUT: Duration = Duration::from_secs(30);
     const LAUNCH_WORKER_GRACE: Duration = Duration::from_secs(5);
     const STARTUP_GATE_TIMEOUT: Duration = Duration::from_secs(10);
-    // The debugger's initial breakpoint is the earliest user-mode point at
-    // which the process loader has mapped kernel32 and accepts a remote
-    // LoadLibrary thread. It lets us inject and arm before `Wow.exe` executes
-    // any application startup code or initializes D3D9.
+    const DLL_INJECTION_TIMEOUT: Duration = Duration::from_secs(15);
+    // Stop at the *application* entry point, rather than at the loader's
+    // initial debugger breakpoint. The latter can still run while the native
+    // loader lock is owned by the primary thread, which deadlocks a remote
+    // `LoadLibraryW` thread. At the executable entry point the loader has
+    // completed, but WoW has not executed any game code or initialized D3D9.
     const EXCEPTION_BREAKPOINT: u32 = 0x8000_0003;
     const DBG_CONTINUE: u32 = 0x0001_0002;
     const DBG_EXCEPTION_NOT_HANDLED: u32 = 0x8001_0001;
+    const EXCEPTION_DEBUG_EVENT: u32 = 1;
+    const CREATE_PROCESS_DEBUG_EVENT: u32 = 3;
     const EXIT_PROCESS_DEBUG_EVENT: u32 = 5;
+    const DOS_SIGNATURE: [u8; 2] = *b"MZ";
+    const PE_SIGNATURE: [u8; 4] = *b"PE\0\0";
+    const DOS_PE_HEADER_OFFSET: u32 = 0x3C;
+    const PE_COFF_HEADER_SIZE: u32 = 20;
+    const PE_OPTIONAL_HEADER_MAGIC_OFFSET: u32 = 0;
+    const PE_OPTIONAL_HEADER_ADDRESS_OF_ENTRY_POINT_OFFSET: u32 = 16;
+    const PE32_OPTIONAL_HEADER_MAGIC: u16 = 0x10B;
+    const ENTRY_BREAKPOINT: u8 = 0xCC;
     // The ToolHelp module walk can still race a freshly initialized loader.
     // Microsoft documents ERROR_BAD_LENGTH for this case and asks callers to
     // retry the snapshot. Keep that recovery local to every module lookup.
@@ -168,8 +182,24 @@ mod windows_x86 {
     }
 
     #[repr(C)]
+    #[derive(Copy, Clone)]
+    struct CreateProcessDebugInfo {
+        file: Handle,
+        process: Handle,
+        thread: Handle,
+        base_of_image: *mut c_void,
+        debug_info_file_offset: u32,
+        debug_info_size: u32,
+        thread_local_base: *mut c_void,
+        start_address: *mut c_void,
+        image_name: *mut c_void,
+        unicode: u16,
+    }
+
+    #[repr(C)]
     union DebugEventData {
         exception: ExceptionDebugInfo,
+        create_process: CreateProcessDebugInfo,
         raw: [u8; 164],
     }
 
@@ -182,15 +212,65 @@ mod windows_x86 {
     }
 
     impl DebugEvent {
-        fn initial_breakpoint(&self) -> bool {
-            if self.event_code != 1 {
+        fn is_breakpoint(&self) -> bool {
+            if self.event_code != EXCEPTION_DEBUG_EVENT {
                 return false;
             }
             // Safety: the active union member is `exception` exactly when
             // `event_code == EXCEPTION_DEBUG_EVENT` (value 1).
             unsafe { self.data.exception.record.code == EXCEPTION_BREAKPOINT }
         }
+
+        fn exception_address(&self) -> Option<RemoteAddress> {
+            if !self.is_breakpoint() {
+                return None;
+            }
+            // Safety: `is_breakpoint` established that `exception` is active.
+            u32::try_from(unsafe { self.data.exception.record.address as usize }).ok()
+        }
+
+        fn image_base(&self) -> Option<RemoteAddress> {
+            if self.event_code != CREATE_PROCESS_DEBUG_EVENT {
+                return None;
+            }
+            // Safety: the active union member is `create_process` exactly
+            // when `event_code == CREATE_PROCESS_DEBUG_EVENT`.
+            u32::try_from(unsafe { self.data.create_process.base_of_image as usize }).ok()
+        }
     }
+
+    #[repr(C)]
+    #[derive(Copy, Clone)]
+    struct FloatSaveArea {
+        control_word: u32,
+        status_word: u32,
+        tag_word: u32,
+        error_offset: u32,
+        error_selector: u32,
+        data_offset: u32,
+        data_selector: u32,
+        register_area: [u8; 80],
+        cr0_npx_state: u32,
+    }
+
+    #[repr(C)]
+    #[derive(Copy, Clone)]
+    struct ContextX86 {
+        context_flags: u32,
+        debug_registers: [u32; 6],
+        float_save: FloatSaveArea,
+        segment_registers: [u32; 4],
+        general_registers: [u32; 6],
+        ebp: u32,
+        eip: u32,
+        seg_cs: u32,
+        eflags: u32,
+        esp: u32,
+        seg_ss: u32,
+        extended_registers: [u8; 512],
+    }
+
+    const _: () = assert!(core::mem::size_of::<ContextX86>() == 716);
 
     extern "system" {
         fn CloseHandle(handle: Handle) -> i32;
@@ -218,8 +298,10 @@ mod windows_x86 {
         ) -> i32;
         fn ContinueDebugEvent(process_id: u32, thread_id: u32, continue_status: u32) -> i32;
         fn DebugActiveProcessStop(process_id: u32) -> i32;
+        fn FlushInstructionCache(process: Handle, address: *const c_void, size: usize) -> i32;
         fn FreeLibrary(module: Module) -> i32;
         fn GetExitCodeThread(thread: Handle, exit_code: *mut u32) -> i32;
+        fn GetThreadContext(thread: Handle, context: *mut ContextX86) -> i32;
         fn GetCurrentProcess() -> Handle;
         fn GetLastError() -> u32;
         fn GetModuleHandleW(name: *const u16) -> Module;
@@ -237,6 +319,7 @@ mod windows_x86 {
             bytes_read: *mut usize,
         ) -> i32;
         fn ResumeThread(thread: Handle) -> u32;
+        fn SetThreadContext(thread: Handle, context: *const ContextX86) -> i32;
         fn SuspendThread(thread: Handle) -> u32;
         fn VirtualAllocEx(
             process: Handle,
@@ -247,6 +330,13 @@ mod windows_x86 {
         ) -> *mut c_void;
         fn VirtualFreeEx(process: Handle, address: *mut c_void, size: usize, free_type: u32)
             -> i32;
+        fn VirtualProtectEx(
+            process: Handle,
+            address: *mut c_void,
+            size: usize,
+            new_protect: u32,
+            old_protect: *mut u32,
+        ) -> i32;
         fn WaitForSingleObject(handle: Handle, milliseconds: u32) -> u32;
         fn WaitForDebugEvent(event: *mut DebugEvent, milliseconds: u32) -> i32;
         fn WriteProcessMemory(
@@ -534,15 +624,16 @@ mod windows_x86 {
         }
     }
 
-    /// Starts WoW under a short-lived debugger gate, arms D3D9 capture at the
-    /// initial user-mode breakpoint, then lets exactly one injected worker
-    /// configure and start the runtime after capture.
+    /// Starts WoW under a short-lived debugger gate, stops at the executable
+    /// entry point, then arms D3D9 capture before application code runs.
     ///
     /// `CREATE_SUSPENDED` alone is not a usable early-injection gate: after
     /// its first `ResumeThread` the primary thread is no longer suspended, so
-    /// a later "resume" is a no-op. The debugger's initial breakpoint occurs
-    /// after kernel32 is ready for `LoadLibraryW` but before `Wow.exe` has run
-    /// application code, closing the race with `Direct3DCreate9` entirely.
+    /// a later "resume" is a no-op. We deliberately do *not* inject at the
+    /// debugger's initial loader breakpoint: its loader lock can still be
+    /// owned by the stopped primary thread. A temporary entry-point breakpoint
+    /// is reached after that lock is released, while still preceding all WoW
+    /// application code and `Direct3DCreate9`.
     fn run_launch(arguments: LaunchArguments) -> Result<(), String> {
         let mut launched = StartupGate::start(&arguments.executable_path)?;
         println!(
@@ -554,12 +645,12 @@ mod windows_x86 {
         let process = Process::open(launched.process_id)?;
         process.ensure_x86_target()?;
         let local_module = LocalModule::load(&arguments.dll_path)?;
-        // First leave the debugger while preserving the primary thread's
-        // explicit suspend count. Remote `LoadLibraryW` threads created below
-        // must not themselves generate debug events that would otherwise
-        // remain paused behind the initial breakpoint.
+        // The application-entry breakpoint is after the Windows loader's lock
+        // has been released. Leave the debugger while preserving the primary
+        // thread's explicit suspend count, then LoadLibraryW can complete
+        // without racing WoW startup or deadlocking on that loader lock.
         launched.prepare_injection()?;
-        println!("Windows initial loader breakpoint is ready; injecting veyr.dll");
+        println!("WoW application entry point is ready; injecting veyr.dll");
         let remote_module = inject(&process, &arguments.dll_path)?;
 
         let remote_command_rva = local_module.export_rva(b"veyr_remote_command\0")?;
@@ -1821,13 +1912,32 @@ mod windows_x86 {
         "usage: veyr.exe launch <path-to-WoW.exe> <path-to-veyr.dll>\n       veyr.exe <wow-pid> <path-to-veyr.dll>\n       veyr.exe status <wow-pid> <path-to-currently-injected-veyr.dll>\n       veyr.exe terrain <wow-pid> <path-to-currently-injected-veyr.dll>\n       veyr.exe stop <wow-pid> <path-to-currently-injected-veyr.dll>".to_owned()
     }
 
+    /// Loads the DLL with a bounded wait.  At the application-entry gate this
+    /// should complete immediately; the deadline is a fail-safe so no loader
+    /// regression can leave the command prompt waiting forever.
     fn inject(process: &Process, dll_path: &Path) -> Result<u32, String> {
         let wide_path = wide_null(dll_path.as_os_str());
         let remote_path = RemoteAllocation::write_slice(process, &wide_path)?;
         let remote_load_library = remote_load_library_w(process)?;
 
-        let remote_base = call_remote(process, remote_load_library, remote_path.address)
-            .map_err(|error| format!("LoadLibraryW(veyr.dll): {error}"))?;
+        let remote_base = match call_remote_for(
+            process,
+            remote_load_library,
+            remote_path.address,
+            duration_to_wait_millis(DLL_INJECTION_TIMEOUT),
+        ) {
+            Ok(base) => base,
+            // A timed-out thread may still be executing LoadLibraryW and may
+            // still dereference the UTF-16 path. Do not free that parameter
+            // out from under it: this tiny allocation is intentionally leaked
+            // into the newly started process, which will exit normally if the
+            // caller abandons this failed launch.
+            Err(error @ RemoteCallError::Timeout { .. }) => {
+                core::mem::forget(remote_path);
+                return Err(error.describe("LoadLibraryW(veyr.dll)"));
+            }
+            Err(error) => return Err(error.describe("LoadLibraryW(veyr.dll)")),
+        };
         if remote_base == 0 {
             return Err("the target rejected LoadLibraryW for veyr.dll".to_owned());
         }
@@ -1998,6 +2108,16 @@ mod windows_x86 {
             .map_err(|error| error.describe("remote command"))
     }
 
+    fn call_remote_for(
+        process: &Process,
+        address: u32,
+        parameter: u32,
+        milliseconds: u32,
+    ) -> Result<u32, RemoteCallError> {
+        let thread = start_remote_thread(process, address, parameter)?;
+        wait_remote_result_for(thread, milliseconds)
+    }
+
     fn wait_remote_result(thread: HandleGuard) -> Result<u32, RemoteCallError> {
         wait_remote_result_for(thread, INFINITE)
     }
@@ -2076,9 +2196,98 @@ mod windows_x86 {
         })
     }
 
-    /// Owns a newly created WoW process held at the debugger's initial
-    /// breakpoint. This is the first safe user-mode point for injection: the
-    /// target loader is initialized, but the WoW entry point has not run.
+    fn checked_address(
+        base: RemoteAddress,
+        offset: u32,
+        context: &str,
+    ) -> Result<RemoteAddress, String> {
+        base.checked_add(offset)
+            .ok_or_else(|| format!("{context} address overflowed x86 space"))
+    }
+
+    /// Reads a tiny fixed-size value through a short-lived process handle.
+    /// StartupGate deliberately owns only the thread handle; keeping these
+    /// reads local means its error cleanup has no second long-lived handle to
+    /// unwind before it can continue/detach the debugger.
+    fn read_process_bytes<const SIZE: usize>(
+        process_id: u32,
+        address: RemoteAddress,
+        context: &str,
+    ) -> Result<[u8; SIZE], String> {
+        let process = Process::open(process_id)?;
+        read_remote_bytes::<SIZE>(&process, address, context)
+    }
+
+    /// Temporarily makes exactly the byte range writable, writes it in the
+    /// target, and restores the prior page protection even if the write fails.
+    /// This is used solely for the application's one-byte startup breakpoint.
+    fn write_process_bytes(
+        process_id: u32,
+        address: RemoteAddress,
+        bytes: &[u8],
+        context: &str,
+    ) -> Result<(), String> {
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        let process = Process::open(process_id)?;
+        let remote_address = address as usize as *mut c_void;
+        let mut old_protection = 0_u32;
+        if unsafe {
+            VirtualProtectEx(
+                process.handle,
+                remote_address,
+                bytes.len(),
+                PAGE_EXECUTE_READWRITE,
+                &mut old_protection,
+            )
+        } == 0
+        {
+            return Err(last_error(&format!("VirtualProtectEx({context})")));
+        }
+        let mut bytes_written = 0_usize;
+        let write_succeeded = unsafe {
+            WriteProcessMemory(
+                process.handle,
+                remote_address,
+                bytes.as_ptr().cast(),
+                bytes.len(),
+                &mut bytes_written,
+            )
+        };
+        let write_error = if write_succeeded == 0 || bytes_written != bytes.len() {
+            Some(last_error(&format!("WriteProcessMemory({context})")))
+        } else {
+            None
+        };
+        let mut ignored = 0_u32;
+        let restore_succeeded = unsafe {
+            VirtualProtectEx(
+                process.handle,
+                remote_address,
+                bytes.len(),
+                old_protection,
+                &mut ignored,
+            )
+        };
+        if restore_succeeded == 0 {
+            return Err(last_error(&format!("VirtualProtectEx restore ({context})")));
+        }
+        if let Some(error) = write_error {
+            return Err(error);
+        }
+        if unsafe {
+            FlushInstructionCache(process.handle, remote_address.cast_const(), bytes.len())
+        } == 0
+        {
+            return Err(last_error(&format!("FlushInstructionCache({context})")));
+        }
+        Ok(())
+    }
+
+    /// Owns a newly created WoW process held at a temporary breakpoint at the
+    /// executable entry point. The Windows loader has completed at this point,
+    /// so its lock cannot deadlock `LoadLibraryW`, while no WoW code has run.
     ///
     /// Dropping the gate always continues its pending event and detaches the
     /// debugger. Thus any loader-side error still lets the user start WoW
@@ -2090,6 +2299,10 @@ mod windows_x86 {
         primary_thread_suspended: bool,
         debugger_attached: bool,
         released: bool,
+        image_base: Option<RemoteAddress>,
+        entry_point: Option<RemoteAddress>,
+        original_entry_byte: Option<u8>,
+        entry_breakpoint_seen: bool,
     }
 
     impl StartupGate {
@@ -2142,21 +2355,25 @@ mod windows_x86 {
                 primary_thread_suspended: false,
                 debugger_attached: true,
                 released: false,
+                image_base: None,
+                entry_point: None,
+                original_entry_byte: None,
+                entry_breakpoint_seen: false,
             };
-            if let Err(error) = gate.wait_for_initial_breakpoint() {
+            if let Err(error) = gate.wait_for_application_entrypoint() {
                 drop(gate);
                 return Err(error);
             }
             Ok(gate)
         }
 
-        fn wait_for_initial_breakpoint(&mut self) -> Result<(), String> {
+        fn wait_for_application_entrypoint(&mut self) -> Result<(), String> {
             let deadline = Instant::now() + STARTUP_GATE_TIMEOUT;
             loop {
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 if remaining.is_zero() {
                     return Err(
-                        "timed out waiting for WoW's initial Windows loader breakpoint".to_owned(),
+                        "timed out waiting for WoW's application entry-point breakpoint".to_owned(),
                     );
                 }
                 let mut event: DebugEvent = unsafe { zeroed() };
@@ -2174,26 +2391,64 @@ mod windows_x86 {
                     };
                     continue;
                 }
+                if event.event_code == CREATE_PROCESS_DEBUG_EVENT {
+                    if self.image_base.is_none() {
+                        let image_base = event.image_base().ok_or_else(|| {
+                            "WoW reported an application image base outside the x86 address space"
+                                .to_owned()
+                        })?;
+                        self.image_base = Some(image_base);
+                    }
+                    if unsafe {
+                        ContinueDebugEvent(event.process_id, event.thread_id, DBG_CONTINUE)
+                    } == 0
+                    {
+                        return Err(last_error("ContinueDebugEvent(create process)"));
+                    }
+                    continue;
+                }
                 if event.event_code == EXIT_PROCESS_DEBUG_EVENT {
                     let _ = unsafe {
                         ContinueDebugEvent(event.process_id, event.thread_id, DBG_CONTINUE)
                     };
-                    return Err(
-                        "WoW exited before reaching its initial loader breakpoint".to_owned()
-                    );
+                    return Err("WoW exited before reaching its application entry point".to_owned());
                 }
-                if event.initial_breakpoint() {
+                if event.is_breakpoint() && self.entry_breakpoint_seen {
+                    let entry_point = self.entry_point.expect("entry breakpoint has an address");
+                    if event.exception_address() != Some(entry_point) {
+                        if unsafe {
+                            ContinueDebugEvent(
+                                event.process_id,
+                                event.thread_id,
+                                DBG_EXCEPTION_NOT_HANDLED,
+                            )
+                        } == 0
+                        {
+                            return Err(last_error("ContinueDebugEvent(unexpected breakpoint)"));
+                        }
+                        continue;
+                    }
                     // Keep the original primary thread stopped after we
                     // continue this debug event. Windows otherwise resumes
-                    // it as part of ContinueDebugEvent, and calling
-                    // DebugActiveProcessStop immediately afterward lets WoW
-                    // race D3D9 creation before the hook is armed.
+                    // it as part of ContinueDebugEvent, and detaching without
+                    // a suspend would let WoW race D3D9 creation.
                     if unsafe { SuspendThread(self.primary_thread) } == u32::MAX {
                         return Err(last_error("SuspendThread(primary thread)"));
                     }
                     self.primary_thread_suspended = true;
                     self.pending_event = Some((event.process_id, event.thread_id));
                     return Ok(());
+                }
+                if event.is_breakpoint() && self.entry_point.is_none() {
+                    self.install_application_entry_breakpoint()?;
+                    self.entry_breakpoint_seen = true;
+                    if unsafe {
+                        ContinueDebugEvent(event.process_id, event.thread_id, DBG_CONTINUE)
+                    } == 0
+                    {
+                        return Err(last_error("ContinueDebugEvent(initial loader breakpoint)"));
+                    }
+                    continue;
                 }
                 if unsafe {
                     ContinueDebugEvent(event.process_id, event.thread_id, DBG_EXCEPTION_NOT_HANDLED)
@@ -2204,22 +2459,128 @@ mod windows_x86 {
             }
         }
 
-        /// Continues the initial debugger event and detaches while preserving
-        /// the primary thread's suspend count. After this returns it is safe
-        /// to create ordinary remote threads: no debug events remain pending,
-        /// but WoW itself still cannot advance into its entry point.
+        /// Parses the in-memory PE32 header for WoW's entry RVA and plants a
+        /// single `INT3` there. This avoids guessing from a hard-coded image
+        /// base and remains valid for ASLR-enabled copies of the supported
+        /// x86 client.
+        fn install_application_entry_breakpoint(&mut self) -> Result<(), String> {
+            let image_base = self.image_base.ok_or_else(|| {
+                "WoW did not report its application image base before the loader breakpoint"
+                    .to_owned()
+            })?;
+            let dos_signature =
+                read_process_bytes::<2>(self.process_id, image_base, "WoW DOS signature")?;
+            if dos_signature != DOS_SIGNATURE {
+                return Err("WoW application image does not have an MZ DOS signature".to_owned());
+            }
+            let pe_offset = u32::from_le_bytes(read_process_bytes::<4>(
+                self.process_id,
+                checked_address(image_base, DOS_PE_HEADER_OFFSET, "WoW PE-header offset")?,
+                "WoW PE-header offset",
+            )?);
+            let pe_header = checked_address(image_base, pe_offset, "WoW PE header")?;
+            let signature =
+                read_process_bytes::<4>(self.process_id, pe_header, "WoW PE signature")?;
+            if signature != PE_SIGNATURE {
+                return Err("WoW application image does not have a PE signature".to_owned());
+            }
+            let optional_header =
+                checked_address(pe_header, 4 + PE_COFF_HEADER_SIZE, "WoW optional header")?;
+            let optional_magic = u16::from_le_bytes(read_process_bytes::<2>(
+                self.process_id,
+                checked_address(
+                    optional_header,
+                    PE_OPTIONAL_HEADER_MAGIC_OFFSET,
+                    "WoW optional-header magic",
+                )?,
+                "WoW optional-header magic",
+            )?);
+            if optional_magic != PE32_OPTIONAL_HEADER_MAGIC {
+                return Err(format!(
+                    "WoW application image is not PE32 (optional-header magic 0x{optional_magic:04X})"
+                ));
+            }
+            let entry_rva = u32::from_le_bytes(read_process_bytes::<4>(
+                self.process_id,
+                checked_address(
+                    optional_header,
+                    PE_OPTIONAL_HEADER_ADDRESS_OF_ENTRY_POINT_OFFSET,
+                    "WoW entry-point RVA",
+                )?,
+                "WoW entry-point RVA",
+            )?);
+            if entry_rva == 0 {
+                return Err("WoW application image has a null entry-point RVA".to_owned());
+            }
+            let entry_point =
+                checked_address(image_base, entry_rva, "WoW application entry point")?;
+            let original_entry_byte = read_process_bytes::<1>(
+                self.process_id,
+                entry_point,
+                "WoW application entry byte",
+            )?[0];
+            write_process_bytes(
+                self.process_id,
+                entry_point,
+                &[ENTRY_BREAKPOINT],
+                "WoW application entry breakpoint",
+            )?;
+            self.entry_point = Some(entry_point);
+            self.original_entry_byte = Some(original_entry_byte);
+            Ok(())
+        }
+
+        /// Restores the application entry byte, rewinds EIP over `INT3`, then
+        /// continues the matching debugger event and detaches. The primary
+        /// thread remains explicitly suspended until `release`.
         fn prepare_injection(&mut self) -> Result<(), String> {
+            self.restore_application_entrypoint()?;
             let (process_id, thread_id) = self
                 .pending_event
                 .take()
                 .ok_or_else(|| "WoW startup gate has no pending debug event".to_owned())?;
             if unsafe { ContinueDebugEvent(process_id, thread_id, DBG_CONTINUE) } == 0 {
-                return Err(last_error("ContinueDebugEvent(initial loader breakpoint)"));
+                return Err(last_error("ContinueDebugEvent(application entry point)"));
             }
             if unsafe { DebugActiveProcessStop(self.process_id) } == 0 {
                 return Err(last_error("DebugActiveProcessStop"));
             }
             self.debugger_attached = false;
+            Ok(())
+        }
+
+        fn restore_application_entrypoint(&mut self) -> Result<(), String> {
+            let entry_point = self
+                .entry_point
+                .ok_or_else(|| "WoW startup gate has no application entry point".to_owned())?;
+            let original_byte = self
+                .original_entry_byte
+                .take()
+                .ok_or_else(|| "WoW startup gate has no saved application entry byte".to_owned())?;
+            write_process_bytes(
+                self.process_id,
+                entry_point,
+                &[original_byte],
+                "restore WoW application entry byte",
+            )?;
+            let mut context: ContextX86 = unsafe { zeroed() };
+            context.context_flags = CONTEXT_CONTROL;
+            if unsafe { GetThreadContext(self.primary_thread, &mut context) } == 0 {
+                return Err(last_error("GetThreadContext(application entry point)"));
+            }
+            let expected_after_breakpoint = entry_point
+                .checked_add(1)
+                .ok_or_else(|| "WoW application entry breakpoint address overflowed".to_owned())?;
+            if context.eip != expected_after_breakpoint {
+                return Err(format!(
+                    "WoW primary thread stopped at unexpected EIP 0x{:08X}, expected 0x{expected_after_breakpoint:08X}",
+                    context.eip
+                ));
+            }
+            context.eip = entry_point;
+            if unsafe { SetThreadContext(self.primary_thread, &context) } == 0 {
+                return Err(last_error("SetThreadContext(application entry point)"));
+            }
             Ok(())
         }
 
@@ -2243,6 +2604,16 @@ mod windows_x86 {
 
     impl Drop for StartupGate {
         fn drop(&mut self) {
+            if let (Some(entry_point), Some(original_byte)) =
+                (self.entry_point, self.original_entry_byte.take())
+            {
+                let _ = write_process_bytes(
+                    self.process_id,
+                    entry_point,
+                    &[original_byte],
+                    "restore WoW application entry byte during cleanup",
+                );
+            }
             if let Some((process_id, thread_id)) = self.pending_event.take() {
                 unsafe {
                     let _ = ContinueDebugEvent(process_id, thread_id, DBG_CONTINUE);
