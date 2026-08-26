@@ -1,9 +1,9 @@
 {
   "schema_version": 1,
   "channel": "dev",
-  "source_commit": "00c3a095da8a3fd88265100a214fc492cc148bda",
+  "source_commit": "fe4da39a5e8aa744c02e968be610ba96476b5012",
   "source_ref": "dev",
-  "source_tree": "dirty",
+  "source_tree": "clean",
   "target": "i686-pc-windows-gnu",
   "profile": "release",
   "artifacts": {
