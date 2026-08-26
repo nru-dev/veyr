@@ -38,6 +38,11 @@ fn remote_command_values_are_stable_for_the_windows_loader_abi() {
     assert_eq!(RemoteCommand::TerrainProbeHitY as u32, 31);
     assert_eq!(RemoteCommand::TerrainProbeHitZ as u32, 32);
     assert_eq!(RemoteCommand::TerrainProbeNativeResult as u32, 33);
+    assert_eq!(RemoteCommand::LifecycleState as u32, 34);
+    assert_eq!(RemoteCommand::AbortLaunch as u32, 35);
+    assert_eq!(RemoteCommand::D3d9CreateDeviceSuccessCount as u32, 36);
+    assert_eq!(RemoteCommand::D3d9LastCreateDeviceResult as u32, 37);
+    assert_eq!(RemoteCommand::ConfiguredD3d9Device as u32, 38);
 }
 
 #[test]
@@ -53,13 +58,14 @@ fn graphics_configuration_abi_is_plain_x86_words() {
 fn launch_worker_abi_is_plain_words_and_starts_pending() {
     let request = RemoteLaunchRequest::player_circle(30_000);
 
-    assert_eq!(REMOTE_LAUNCH_ABI_VERSION, 1);
+    assert_eq!(REMOTE_LAUNCH_ABI_VERSION, 3);
     assert_eq!(request.abi_version, REMOTE_LAUNCH_ABI_VERSION);
     assert_eq!(request.capture_timeout_millis, 30_000);
+    assert_eq!(request.cancel_requested, 0);
     assert_eq!(request.report.abi_version, REMOTE_LAUNCH_ABI_VERSION);
     assert_eq!(request.report.outcome, RemoteLaunchOutcome::Pending as u32);
-    assert_eq!(core::mem::size_of::<RemoteLaunchReport>(), 48);
+    assert_eq!(core::mem::size_of::<RemoteLaunchReport>(), 56);
     assert_eq!(core::mem::align_of::<RemoteLaunchReport>(), 4);
-    assert_eq!(core::mem::size_of::<RemoteLaunchRequest>(), 56);
+    assert_eq!(core::mem::size_of::<RemoteLaunchRequest>(), 68);
     assert_eq!(core::mem::align_of::<RemoteLaunchRequest>(), 4);
 }

@@ -1,8 +1,21 @@
 .DS_Store
+# Rust build output is reproducible and must stay outside version control.
+/target/
+
+# Local deployment settings contain credentials and must never be shared.
+.ftp-deploy.env
+
+# Runtime diagnostics, crash dumps, and local scratch files.
+/veyr_logs/
+*.log
+*.dmp
+*.tmp
+
 # Only the current deliverables and explicit stable checkpoint are tracked.
 /dist/*.dll
 !/dist/veyr.dll
 /dist/*.exe
+!/dist/veyr.exe
 !/dist/veyr_loader.exe
 !/dist/manifest.json
 /dist/stable/*

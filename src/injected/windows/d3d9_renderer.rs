@@ -91,8 +91,11 @@ const DEVICE_GET_VERTEX_SHADER: usize = 93;
 const DEVICE_SET_PIXEL_SHADER: usize = 107;
 const DEVICE_GET_PIXEL_SHADER: usize = 108;
 const DEVICE_DRAW_PRIMITIVE_UP: usize = 83;
-const DEVICE_GET_STREAM_SOURCE: usize = 103;
-const DEVICE_SET_STREAM_SOURCE: usize = 102;
+// These immediately precede Set/GetStreamSourceFreq (102/103).  Calling the
+// latter slots with the four-argument stream-source ABI corrupts the x86
+// stdcall stack on the first overlay frame.
+const DEVICE_GET_STREAM_SOURCE: usize = 101;
+const DEVICE_SET_STREAM_SOURCE: usize = 100;
 
 const IUNKNOWN_RELEASE: usize = 2;
 

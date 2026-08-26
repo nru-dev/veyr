@@ -277,26 +277,49 @@ enum ActiveHooks {
 
 impl ActiveHooks {
     fn uninstall(&mut self) -> Result<(), EndSceneHookError> {
+        let mut first_error = None;
         match self {
             Self::D3d9 { end_scene, reset } => {
-                reset.uninstall()?;
-                ORIGINAL_RESET.store(0, Ordering::Release);
-                end_scene.uninstall()?;
-                ORIGINAL_END_SCENE.store(0, Ordering::Release);
+                // Reset is removed first, matching the old runtime ordering:
+                // no device-lifecycle callback can race a half-uninstalled
+                // EndScene hook while its renderer resources are torn down.
+                if let Err(error) = reset.uninstall() {
+                    first_error.get_or_insert(error);
+                }
+                if let Err(error) = end_scene.uninstall() {
+                    first_error.get_or_insert(error);
+                }
             }
             Self::OpenGl {
                 wgl_swap_buffers,
                 gdi_swap_buffers,
             } => {
                 if let Some(gdi_swap_buffers) = gdi_swap_buffers {
-                    gdi_swap_buffers.uninstall()?;
-                    ORIGINAL_GDI_SWAP_BUFFERS.store(0, Ordering::Release);
+                    if let Err(error) = gdi_swap_buffers.uninstall() {
+                        first_error = Some(error);
+                    }
                 }
-                wgl_swap_buffers.uninstall()?;
-                ORIGINAL_WGL_SWAP_BUFFERS.store(0, Ordering::Release);
+                if let Err(error) = wgl_swap_buffers.uninstall() {
+                    first_error.get_or_insert(error);
+                }
             }
         }
-        Ok(())
+        first_error.map_or(Ok(()), Err)
+    }
+
+    fn is_active(&self) -> bool {
+        match self {
+            Self::D3d9 { end_scene, reset } => end_scene.is_active() || reset.is_active(),
+            Self::OpenGl {
+                wgl_swap_buffers,
+                gdi_swap_buffers,
+            } => {
+                wgl_swap_buffers.is_active()
+                    || gdi_swap_buffers
+                        .as_ref()
+                        .is_some_and(SwapBuffersHook::is_active)
+            }
+        }
     }
 }
 
@@ -443,6 +466,15 @@ pub fn configured_d3d9_targets() -> hooks::Direct3d9Targets {
     }
 }
 
+/// Live D3D9 device supplied by the loader, or zero for a non-D3D9 backend.
+#[must_use]
+pub fn configured_d3d9_device() -> RemoteAddress {
+    match *recover_lock(graphics_targets().lock()) {
+        GraphicsTargets::D3d9 { device, .. } => device,
+        GraphicsTargets::OpenGl { .. } => 0,
+    }
+}
+
 #[must_use]
 pub fn configured_opengl_target() -> RemoteAddress {
     match *recover_lock(graphics_targets().lock()) {
@@ -474,10 +506,13 @@ where
     CALLBACK_PANIC_COUNT.store(0, Ordering::Release);
     reset_renderer_stats();
     let hooks = match targets {
-        GraphicsTargets::D3d9 { targets: _, device } => {
-            let device = device as usize as *mut c_void;
+        GraphicsTargets::D3d9 { targets, .. } => {
+            // Install the lifecycle hook first, then the frame hook. This is
+            // the ordering used by the known-working runtime and keeps Reset
+            // callbacks available while EndScene is being armed.
             let mut reset =
-                match unsafe { ResetHook::install(device, reset_dispatch, &ORIGINAL_RESET) } {
+                match unsafe { ResetHook::install(targets.reset, reset_dispatch, &ORIGINAL_RESET) }
+                {
                     Ok(hook) => hook,
                     Err(error) => {
                         ORIGINAL_RESET.store(0, Ordering::Release);
@@ -486,7 +521,7 @@ where
                 };
 
             let end_scene = match unsafe {
-                EndSceneHook::install(device, end_scene_dispatch, &ORIGINAL_END_SCENE)
+                EndSceneHook::install(targets.end_scene, end_scene_dispatch, &ORIGINAL_END_SCENE)
             } {
                 Ok(hook) => hook,
                 Err(error) => {
@@ -588,9 +623,14 @@ pub unsafe fn start_player_circle() -> Result<(), RuntimeStartError> {
 pub fn stop() -> Result<(), RuntimeStopError> {
     let mut slot = recover_lock(active_runtime().lock());
     let active = slot.as_mut().ok_or(RuntimeStopError::NotRunning)?;
-    active.hooks.uninstall().map_err(RuntimeStopError::Hook)?;
-    *slot = None;
-    Ok(())
+    let result = active.hooks.uninstall().map_err(RuntimeStopError::Hook);
+    if !active.hooks.is_active() {
+        // Preserve the original dispatch targets. A native thread might have
+        // fetched one replacement immediately before its vtable slot was
+        // restored; it must still be able to delegate to the real method.
+        *slot = None;
+    }
+    result
 }
 
 #[must_use]

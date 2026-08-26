@@ -991,8 +991,15 @@ mod layout {
 
                 /// Static pointer to the client's `GxDevice` owner.
                 pub const GX_DEVICE: Address = 0x00C5_DF88;
-                /// `IDirect3DDevice9*` member inside the active `GxDevice`.
-                pub const DEVICE: Offset = 0x3C;
+                /// Legacy 3.3.5a `IDirect3DDevice9*` member inside the active
+                /// graphics owner. This is retained as a loader probe only:
+                /// its result is always validated against the target process's
+                /// mapped `d3d9.dll` before it is used.
+                pub const DEVICE: Offset = 0x3960;
+                /// A compact-layout candidate observed in an earlier map. It
+                /// is tried only after [`DEVICE`] and is never trusted without
+                /// the same full vtable/module validation.
+                pub const DEVICE_FALLBACK: Offset = 0x3C;
 
                 pub const RESET_INDEX: u32 = 16;
                 pub const PRESENT_INDEX: u32 = 17;

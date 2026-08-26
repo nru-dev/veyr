@@ -156,4 +156,13 @@ veyr_build_windows() {
     mv -f "$stage_dir/veyr.exe" "$output_dir/veyr.exe"
     mv -f "$stage_dir/manifest.json" "$output_dir/manifest.json"
     rmdir "$stage_dir" 2>/dev/null || true
+
+    # The deployment script verifies the manifest again and uploads the
+    # manifest last, so a client never observes it before the matching binary
+    # pair. It is intentionally opt-out for emergency local-only builds.
+    if [[ "${VEYR_FTP_UPLOAD:-1}" == "1" ]]; then
+        "$VEYR_SCRIPTS_DIR/upload-windows-ftp.zsh"
+    else
+        print -- "FTP deployment skipped (VEYR_FTP_UPLOAD=${VEYR_FTP_UPLOAD})"
+    fi
 }

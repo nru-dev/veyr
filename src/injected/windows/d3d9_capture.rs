@@ -42,12 +42,29 @@ impl D3d9CaptureState {
     }
 }
 
+/// Whether temporary factory-capture hooks remain installed.
+#[must_use]
+pub fn is_active() -> bool {
+    let hooks = recover_lock(capture_hooks().lock());
+    hooks.as_ref().is_some_and(|hooks| {
+        hooks.direct3d_create9.is_active()
+            || hooks
+                .create_device
+                .as_ref()
+                .is_some_and(DirectHook::is_active)
+    })
+}
+
 /// Snapshot of one early D3D9 capture attempt.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub struct D3d9CaptureSnapshot {
     pub state: D3d9CaptureState,
     pub factory_calls: u32,
     pub create_device_calls: u32,
+    /// Number of successful CreateDevice calls observed while capture was armed.
+    pub create_device_successes: u32,
+    /// HRESULT returned by the most recent CreateDevice call, represented as raw u32.
+    pub last_create_device_result: u32,
     pub device: RemoteAddress,
     pub targets: Direct3d9Targets,
     /// Zero means that installing and observing the capture hooks succeeded.
@@ -55,11 +72,10 @@ pub struct D3d9CaptureSnapshot {
 }
 
 type Direct3dCreate9Fn = unsafe extern "system" fn(sdk_version: u32) -> *mut c_void;
-/// `IDirect3D9::CreateDevice` is a COM `STDMETHODCALLTYPE` method. On x86
-/// this is `__stdcall`: the interface pointer and six documented arguments
-/// are all stack arguments, and the callee pops seven words. Do not use Rust
-/// `thiscall` here just because the native caller was compiled from C++; the
-/// vtable ABI is COM, not an ordinary C++ member-function ABI.
+/// `IDirect3D9::CreateDevice` is a COM `STDMETHODCALLTYPE` method. On the
+/// supported x86 target this is `__stdcall`: `this` is the first stack
+/// argument and the callee pops all seven words. It is not a C++
+/// `__thiscall` member-function call.
 type CreateDeviceFn = unsafe extern "system" fn(
     factory: *mut c_void,
     adapter: u32,
@@ -86,6 +102,8 @@ const ERROR_CALLBACK_FAULT: u32 = 107;
 static STATE: AtomicU32 = AtomicU32::new(D3d9CaptureState::Idle as u32);
 static FACTORY_CALLS: AtomicU32 = AtomicU32::new(0);
 static CREATE_DEVICE_CALLS: AtomicU32 = AtomicU32::new(0);
+static CREATE_DEVICE_SUCCESSES: AtomicU32 = AtomicU32::new(0);
+static LAST_CREATE_DEVICE_RESULT: AtomicU32 = AtomicU32::new(0);
 static CAPTURED_DEVICE: AtomicU32 = AtomicU32::new(0);
 static CAPTURED_END_SCENE: AtomicU32 = AtomicU32::new(0);
 static CAPTURED_RESET: AtomicU32 = AtomicU32::new(0);
@@ -164,6 +182,8 @@ pub fn snapshot() -> D3d9CaptureSnapshot {
         state: D3d9CaptureState::from_raw(STATE.load(Ordering::Acquire)),
         factory_calls: FACTORY_CALLS.load(Ordering::Acquire),
         create_device_calls: CREATE_DEVICE_CALLS.load(Ordering::Acquire),
+        create_device_successes: CREATE_DEVICE_SUCCESSES.load(Ordering::Acquire),
+        last_create_device_result: LAST_CREATE_DEVICE_RESULT.load(Ordering::Acquire),
         device: CAPTURED_DEVICE.load(Ordering::Acquire),
         targets: Direct3d9Targets {
             end_scene: CAPTURED_END_SCENE.load(Ordering::Acquire),
@@ -240,6 +260,7 @@ unsafe extern "system" fn create_device_dispatch(
     if original == 0 {
         return -1;
     }
+    CREATE_DEVICE_CALLS.fetch_add(1, Ordering::Relaxed);
     let result = unsafe {
         call_create_device(
             original,
@@ -252,6 +273,7 @@ unsafe extern "system" fn create_device_dispatch(
             returned_device,
         )
     };
+    LAST_CREATE_DEVICE_RESULT.store(result as u32, Ordering::Release);
     if result < 0 || returned_device.is_null() {
         return result;
     }
@@ -286,7 +308,7 @@ unsafe fn observe_factory(factory: *mut c_void) -> Result<(), u32> {
 }
 
 unsafe fn observe_created_device(device: *mut c_void) -> Result<(), u32> {
-    CREATE_DEVICE_CALLS.fetch_add(1, Ordering::Relaxed);
+    CREATE_DEVICE_SUCCESSES.fetch_add(1, Ordering::Relaxed);
     unsafe { publish_device(device) }
 }
 
@@ -405,6 +427,8 @@ fn callback_address(callback: *const ()) -> RemoteAddress {
 fn reset_observation() {
     FACTORY_CALLS.store(0, Ordering::Release);
     CREATE_DEVICE_CALLS.store(0, Ordering::Release);
+    CREATE_DEVICE_SUCCESSES.store(0, Ordering::Release);
+    LAST_CREATE_DEVICE_RESULT.store(0, Ordering::Release);
     CAPTURED_DEVICE.store(0, Ordering::Release);
     CAPTURED_END_SCENE.store(0, Ordering::Release);
     CAPTURED_RESET.store(0, Ordering::Release);
